@@ -41,6 +41,7 @@ STATE_ERROR = "ERROR"
 # Event-driven settings
 EVENT_DEBOUNCE_MS = 15  # Минимальный интервал между обработками (снижен с 50ms для быстрой реакции)
 POSITION_CHECK_INTERVAL = 0.5  # Интервал проверки SL/TP для позиций в HOLD
+POSITION_VALIDATION_INTERVAL = 30.0  # FIX Problem 1: Интервал сверки позиций с биржами (сек)
 
 
 # ==============================
@@ -161,24 +162,68 @@ class PairState:
 # Глобальный контроллер риска
 # ==============================
 
+# FIX Problem 3: TTL для кэша настроек (секунды)
+SETTINGS_CACHE_TTL = 10.0
+
+
 class RiskController:
+    """
+    FIX Problem 3: Исправлен deadlock - DB запросы теперь вне lock.
+    Используется кэширование max_open с TTL для избежания блокировки.
+    """
+
     def __init__(self, db: DBManager):
         self.db = db
         self._lock = asyncio.Lock()
         self._open_pairs_count: int = 0
         self._current_risk_usdt: float = 0.0
 
+        # FIX Problem 3: Кэш для max_open_positions
+        self._cached_max_open: int = MAX_OPEN_PAIRS
+        self._cache_updated_at: float = 0.0
+
+    async def _get_max_open_cached(self) -> int:
+        """
+        FIX Problem 3: Получить max_open с кэшированием.
+        Кэш обновляется раз в SETTINGS_CACHE_TTL секунд.
+        Этот метод вызывается ВНЕ lock для предотвращения deadlock.
+        """
+        now = time.time()
+        if now - self._cache_updated_at > SETTINGS_CACHE_TTL:
+            try:
+                self._cached_max_open = await asyncio.wait_for(
+                    self.db.get_setting_int("max_open_positions", MAX_OPEN_PAIRS),
+                    timeout=5.0  # 5 секунд таймаут на DB запрос
+                )
+                self._cache_updated_at = now
+            except asyncio.TimeoutError:
+                logger.warning("[RiskController] DB timeout getting max_open, using cached value")
+            except Exception as e:
+                logger.warning(f"[RiskController] DB error getting max_open: {e}, using cached value")
+        return self._cached_max_open
+
     async def refresh_from_state(self, pair_states: Dict[int, PairState]):
+        # FIX Problem 3: DB запросы вне lock
+        try:
+            risk_usdt = float(await asyncio.wait_for(
+                self.db.get_total_open_notional(),
+                timeout=5.0
+            ))
+        except (AttributeError, TypeError, asyncio.TimeoutError):
+            risk_usdt = 0.0
+        except Exception:
+            risk_usdt = 0.0
+
         async with self._lock:
             self._open_pairs_count = sum(1 for s in pair_states.values() if s.open_parts > 0)
-            try:
-                self._current_risk_usdt = float(await self.db.get_total_open_notional())
-            except (AttributeError, TypeError):
-                self._current_risk_usdt = 0.0
+            self._current_risk_usdt = risk_usdt
 
     async def try_acquire_entry_slot(self, planned_notional: float) -> Tuple[bool, str]:
+        # FIX Problem 3: Получаем max_open ВНЕ lock (может занять время из-за DB)
+        max_open = await self._get_max_open_cached()
+
+        # Теперь быстрая операция под lock (только in-memory)
         async with self._lock:
-            max_open = await self.db.get_setting_int("max_open_positions", MAX_OPEN_PAIRS)
             remaining_slots = max_open - self._open_pairs_count
             if remaining_slots <= 0:
                 return False, "NO_ENTRY_SLOTS"
@@ -198,7 +243,8 @@ class RiskController:
             self._current_risk_usdt = max(0.0, self._current_risk_usdt - planned_notional)
 
     async def get_snapshot(self) -> Dict[str, Any]:
-        max_open = await self.db.get_setting_int("max_open_positions", MAX_OPEN_PAIRS)
+        # FIX Problem 3: Используем кэшированное значение
+        max_open = await self._get_max_open_cached()
         return {
             "open_pairs_count": self._open_pairs_count,
             "max_open_positions": max_open,
@@ -398,6 +444,7 @@ class TradingCore:
         asyncio.create_task(self._pair_sync_loop())
         asyncio.create_task(self._position_monitor_loop())
         asyncio.create_task(self._risk_refresh_loop())
+        asyncio.create_task(self._position_validation_loop())  # FIX Problem 1
         
         # Wait for shutdown
         await self.shutdown_mgr.wait_for_shutdown()
@@ -950,6 +997,131 @@ class TradingCore:
             except Exception as e:
                 logger.error(f"Error refreshing risk: {e}")
             await asyncio.sleep(1.0)
+
+    # FIX Problem 1: Периодическая сверка позиций с биржами
+    async def _position_validation_loop(self):
+        """
+        Background task to periodically validate positions against exchanges.
+
+        Detects:
+        - Liquidations (position closed by exchange)
+        - Manual closes (position closed outside bot)
+        - Volume mismatches (partial fills not tracked)
+        """
+        while not self.shutdown_mgr.is_shutdown_requested:
+            try:
+                await asyncio.sleep(POSITION_VALIDATION_INTERVAL)
+
+                if not self.pair_states:
+                    continue
+
+                # Only validate pairs with open positions
+                pairs_to_validate = [
+                    (pid, state) for pid, state in self.pair_states.items()
+                    if state.open_parts > 0 and state.long_exchange and state.short_exchange
+                ]
+
+                if not pairs_to_validate:
+                    continue
+
+                logger.debug(f"[VALIDATION] Checking {len(pairs_to_validate)} positions...")
+
+                for pair_id, state in pairs_to_validate:
+                    if self.shutdown_mgr.is_shutdown_requested:
+                        break
+
+                    try:
+                        # Get real positions from exchanges
+                        real_long = await self.ex_manager.get_position(
+                            state.long_exchange, state.symbol
+                        )
+                        real_short = await self.ex_manager.get_position(
+                            state.short_exchange, state.symbol
+                        )
+
+                        real_long_size = abs(float(real_long.get("contracts", 0) if real_long else 0))
+                        real_short_size = abs(float(real_short.get("contracts", 0) if real_short else 0))
+
+                        # Expected volumes from state
+                        expected_long = state.actual_long_volume if state.actual_long_volume > 0 else state.open_volume
+                        expected_short = state.actual_short_volume if state.actual_short_volume > 0 else state.open_volume
+
+                        # Check for liquidation (both legs gone)
+                        if real_long_size < expected_long * 0.05 and real_short_size < expected_short * 0.05:
+                            logger.critical(
+                                f"[VALIDATION] LIQUIDATION DETECTED pair={pair_id} {state.symbol} | "
+                                f"Expected: L={expected_long:.4f} S={expected_short:.4f} | "
+                                f"Real: L={real_long_size:.4f} S={real_short_size:.4f}"
+                            )
+                            await self.db.log_trade_event(
+                                pair_id, "LIQUIDATION_DETECTED", "critical",
+                                "Both legs appear liquidated or closed externally",
+                                {"expected_long": expected_long, "expected_short": expected_short,
+                                 "real_long": real_long_size, "real_short": real_short_size}
+                            )
+                            # Reset state and pause
+                            state.reset_after_exit()
+                            state.status = STATE_PAUSED
+                            await self.db.update_pair_status(pair_id, "paused")
+                            await self.db.delete_position(pair_id)
+                            continue
+
+                        # Check for single-leg liquidation (one leg gone)
+                        long_missing = real_long_size < expected_long * 0.5
+                        short_missing = real_short_size < expected_short * 0.5
+
+                        if long_missing and not short_missing:
+                            logger.critical(
+                                f"[VALIDATION] LONG LEG MISSING pair={pair_id} {state.symbol} | "
+                                f"Real LONG={real_long_size:.4f}, Expected={expected_long:.4f}"
+                            )
+                            await self.db.log_trade_event(
+                                pair_id, "LONG_LEG_MISSING", "critical",
+                                "Long leg liquidated/closed, SHORT still open - MANUAL INTERVENTION REQUIRED",
+                                {"expected_long": expected_long, "real_long": real_long_size}
+                            )
+                            state.status = STATE_ERROR
+                            await self.db.update_pair_status(pair_id, "error")
+                            continue
+
+                        if short_missing and not long_missing:
+                            logger.critical(
+                                f"[VALIDATION] SHORT LEG MISSING pair={pair_id} {state.symbol} | "
+                                f"Real SHORT={real_short_size:.4f}, Expected={expected_short:.4f}"
+                            )
+                            await self.db.log_trade_event(
+                                pair_id, "SHORT_LEG_MISSING", "critical",
+                                "Short leg liquidated/closed, LONG still open - MANUAL INTERVENTION REQUIRED",
+                                {"expected_short": expected_short, "real_short": real_short_size}
+                            )
+                            state.status = STATE_ERROR
+                            await self.db.update_pair_status(pair_id, "error")
+                            continue
+
+                        # Check for significant mismatch (>10% diff)
+                        long_mismatch = abs(real_long_size - expected_long) > expected_long * 0.10
+                        short_mismatch = abs(real_short_size - expected_short) > expected_short * 0.10
+
+                        if long_mismatch or short_mismatch:
+                            logger.warning(
+                                f"[VALIDATION] VOLUME MISMATCH pair={pair_id} {state.symbol} | "
+                                f"Expected: L={expected_long:.4f} S={expected_short:.4f} | "
+                                f"Real: L={real_long_size:.4f} S={real_short_size:.4f}"
+                            )
+                            # Update actual volumes to match reality
+                            state.actual_long_volume = real_long_size
+                            state.actual_short_volume = real_short_size
+                            await self.db.log_trade_event(
+                                pair_id, "VOLUME_SYNC", "warning",
+                                "Synced actual volumes with exchange",
+                                {"new_long": real_long_size, "new_short": real_short_size}
+                            )
+
+                    except Exception as e:
+                        logger.warning(f"[VALIDATION] Error checking pair {pair_id}: {e}")
+
+            except Exception as e:
+                logger.error(f"Error in position validation loop: {e}")
 
 
 # ==============================

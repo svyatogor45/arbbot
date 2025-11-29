@@ -17,6 +17,8 @@
 #   - Убраны await перед синхронными методами DB
 # ---------------------------------------------------
 import asyncio
+import uuid
+import time
 from typing import Optional, Dict, Any, TypedDict, Tuple
 
 from loguru import logger
@@ -45,6 +47,19 @@ MIN_FILL_RATIO = 0.95  # 95%
 
 # Порог для предупреждения о частичном исполнении
 PARTIAL_FILL_WARNING_RATIO = 0.99  # 99%
+
+# ============================================================
+# FIX Problem 2: КОНФИГУРАЦИЯ EMERGENCY CLOSE
+# ============================================================
+
+# Максимальное количество полных циклов emergency close
+MAX_EMERGENCY_ATTEMPTS = 3
+
+# Таймаут на весь emergency close цикл (секунды)
+EMERGENCY_CLOSE_TIMEOUT = 60.0
+
+# Задержка между emergency попытками (секунды)
+EMERGENCY_RETRY_DELAY = 2.0
 
 
 class OrderResult(TypedDict, total=False):
@@ -187,6 +202,19 @@ class TradeEngine:
     # НИЗКОУРОВНЕВЫЙ ХЕЛПЕР ДЛЯ ОРДЕРОВ
     # ============================================================
 
+    def _generate_client_order_id(self, exchange: str, side: str) -> str:
+        """
+        Генерирует уникальный clientOrderId для дедупликации ордеров.
+
+        Формат: ARB_{exchange}_{side}_{timestamp_ms}_{uuid4_short}
+        Пример: ARB_bybit_buy_1701234567890_a1b2c3d4
+
+        Большинство бирж поддерживают clientOrderId до 32-36 символов.
+        """
+        ts = int(time.time() * 1000)
+        short_uuid = uuid.uuid4().hex[:8]
+        return f"ARB_{exchange[:4]}_{side}_{ts}_{short_uuid}"
+
     async def _order(
         self,
         exchange: str,
@@ -194,6 +222,7 @@ class TradeEngine:
         side: str,
         amount: float,
         params: Optional[dict] = None,
+        client_order_id: Optional[str] = None,
     ) -> OrderResult:
         """
         Базовая обёртка над ExchangeManager.place_order.
@@ -201,6 +230,7 @@ class TradeEngine:
         Гарантирует:
           - отсутствие исключений снаружи (всё сводим к status="error");
           - единый формат результата OrderResult.
+          - FIX #4: clientOrderId для дедупликации ордеров
 
         side: "buy" | "sell"
         """
@@ -213,13 +243,18 @@ class TradeEngine:
                 requested_amount=amount,
             )
 
+        # FIX #4: Генерируем clientOrderId если не передан
+        order_params = dict(params) if params else {}
+        coid = client_order_id or self._generate_client_order_id(exchange, side)
+        order_params["clientOrderId"] = coid
+
         try:
             raw = await self.manager.place_order(
                 exchange_name=exchange,
                 symbol=symbol,
                 side=side,
                 amount=amount,
-                params=params or {},
+                params=order_params,
             )
         except Exception as e:
             logger.exception(
@@ -266,6 +301,9 @@ class TradeEngine:
 
         Успехом считаем любой статус, отличающийся от "error".
 
+        FIX #4: clientOrderId генерируется ОДИН раз и используется во всех retry.
+        Это гарантирует, что биржа отклонит дубликат, если первый ордер уже исполнился.
+
         FIX: Перед retry проверяем позицию на бирже — если ордер уже исполнился,
         не делаем повторный (предотвращает удвоение позиции при network timeout).
 
@@ -276,12 +314,20 @@ class TradeEngine:
         """
         last_result: Optional[OrderResult] = None
 
+        # FIX #4: Генерируем clientOrderId ОДИН раз для всех retry
+        # Биржа отклонит повторный ордер с тем же ID если первый уже исполнился
+        client_order_id = self._generate_client_order_id(exchange, side)
+
         # FIX: Запоминаем позицию ДО первого ордера для детекции исполнения
         position_before = await self.manager.get_position(exchange, symbol)
         contracts_before = abs(float(position_before.get("contracts", 0))) if position_before else 0.0
 
         for attempt in range(1, self.retry_attempts + 1):
-            res = await self._order(exchange, symbol, side, amount, params=params)
+            res = await self._order(
+                exchange, symbol, side, amount,
+                params=params,
+                client_order_id=client_order_id,
+            )
             last_result = res
 
             if res["status"] != "error":
@@ -495,8 +541,13 @@ class TradeEngine:
         pair_id: Optional[int] = None,
     ) -> dict:
         """
-        Экстренное закрытие ноги с ретраями.
-        
+        Экстренное закрытие ноги с ретраями, таймаутом и эскалацией.
+
+        FIX Problem 2: Добавлены:
+        - MAX_EMERGENCY_ATTEMPTS — общий лимит попыток
+        - EMERGENCY_CLOSE_TIMEOUT — таймаут на весь цикл
+        - Эскалация при достижении лимитов
+
         Args:
             exchange: Название биржи
             symbol: Торговая пара
@@ -504,83 +555,114 @@ class TradeEngine:
             amount: Объём для закрытия
             leg_label: Метка для логов
             pair_id: ID пары (для записи в emergency_positions)
-        
+
         Возвращает:
         {
             "success": bool,
             "order": OrderResult,
-            "critical": bool  # True если не удалось закрыть
+            "critical": bool,  # True если не удалось закрыть
+            "escalated": bool  # True если достигнут лимит попыток
         }
         """
+        import time
+        start_time = time.time()
+
         logger.warning(
             f"🚨 EMERGENCY CLOSE [{exchange}] {symbol} {side} {amount} | {leg_label}"
         )
-        
-        close_order = await self._order_with_retries(
-            exchange=exchange,
-            symbol=symbol,
-            side=side,
-            amount=amount,
-            leg_label=leg_label,
-            params={"reduceOnly": True},
-        )
-        
-        if close_order["status"] == "error":
-            logger.critical(
-                f"💀 EMERGENCY CLOSE FAILED [{exchange}] {symbol} {side} {amount} | "
-                f"{leg_label} | msg={close_order.get('msg')}"
+
+        last_order: Optional[OrderResult] = None
+        total_filled = 0.0
+        remaining_amount = amount
+
+        for attempt in range(1, MAX_EMERGENCY_ATTEMPTS + 1):
+            # Check timeout
+            elapsed = time.time() - start_time
+            if elapsed > EMERGENCY_CLOSE_TIMEOUT:
+                logger.critical(
+                    f"💀 EMERGENCY CLOSE TIMEOUT [{exchange}] {symbol} {side} | "
+                    f"elapsed={elapsed:.1f}s > {EMERGENCY_CLOSE_TIMEOUT}s | "
+                    f"filled={total_filled}/{amount}"
+                )
+                break
+
+            logger.info(
+                f"🔄 EMERGENCY CLOSE attempt {attempt}/{MAX_EMERGENCY_ATTEMPTS} "
+                f"[{exchange}] {symbol} {side} {remaining_amount:.6f}"
             )
 
-            # Async DB call
+            close_order = await self._order_with_retries(
+                exchange=exchange,
+                symbol=symbol,
+                side=side,
+                amount=remaining_amount,
+                leg_label=f"{leg_label}_attempt{attempt}",
+                params={"reduceOnly": True},
+            )
+            last_order = close_order
+
+            if close_order["status"] != "error":
+                filled = close_order.get("filled") or 0.0
+                total_filled += filled
+                remaining_amount = amount - total_filled
+
+                # Check if fully closed
+                if total_filled >= amount * MIN_FILL_RATIO:
+                    logger.info(
+                        f"✅ EMERGENCY CLOSE OK [{exchange}] {symbol} {side} | "
+                        f"filled={total_filled}/{amount} | attempts={attempt}"
+                    )
+                    return {
+                        "success": True,
+                        "order": close_order,
+                        "critical": False,
+                        "escalated": False,
+                    }
+
+                # Partially filled - continue trying
+                logger.warning(
+                    f"⚠️ EMERGENCY CLOSE PARTIAL [{exchange}] {symbol} | "
+                    f"filled={total_filled}/{amount}, remaining={remaining_amount}"
+                )
+            else:
+                logger.error(
+                    f"❌ EMERGENCY CLOSE attempt {attempt} FAILED | "
+                    f"msg={close_order.get('msg')}"
+                )
+
+            # Wait before next attempt (unless last attempt)
+            if attempt < MAX_EMERGENCY_ATTEMPTS:
+                await asyncio.sleep(EMERGENCY_RETRY_DELAY)
+
+        # All attempts exhausted or timeout
+        logger.critical(
+            f"💀 EMERGENCY CLOSE ESCALATION [{exchange}] {symbol} {side} | "
+            f"All {MAX_EMERGENCY_ATTEMPTS} attempts failed | "
+            f"filled={total_filled}/{amount} | pair_id={pair_id}"
+        )
+
+        # Save remaining position to DB for manual intervention
+        if remaining_amount > 0:
             await self.db.save_emergency_position(
                 pair_id=pair_id or 0,
                 exchange=exchange,
                 symbol=symbol,
                 side="long" if side == "sell" else "short",
-                amount=amount,
-                reason=f"emergency_close_failed:{close_order.get('msg')}",
-            )
-            
-            return {
-                "success": False,
-                "order": close_order,
-                "critical": True,
-            }
-        
-        close_filled = close_order.get("filled") or 0.0
-        
-        if close_filled < amount * MIN_FILL_RATIO:
-            logger.error(
-                f"🚨 EMERGENCY CLOSE PARTIAL [{exchange}] {symbol} | "
-                f"filled={close_filled}, requested={amount}"
+                amount=remaining_amount,
+                reason=f"emergency_close_escalated:attempts={MAX_EMERGENCY_ATTEMPTS},filled={total_filled}",
             )
 
-            # Сохраняем остаток в БД (async)
-            remaining = amount - close_filled
-            await self.db.save_emergency_position(
-                pair_id=pair_id or 0,
-                exchange=exchange,
-                symbol=symbol,
-                side="long" if side == "sell" else "short",
-                amount=remaining,
-                reason="emergency_close_partial",
-            )
-            
-            return {
-                "success": True,
-                "order": close_order,
-                "critical": True,
-            }
-        
-        logger.info(
-            f"✅ EMERGENCY CLOSE OK [{exchange}] {symbol} {side} | "
-            f"filled={close_filled}"
-        )
-        
         return {
-            "success": True,
-            "order": close_order,
-            "critical": False,
+            "success": total_filled > 0,
+            "order": last_order or OrderResult(
+                status="error",
+                data=None,
+                msg="all_emergency_attempts_failed",
+                filled=total_filled,
+                requested_amount=amount,
+            ),
+            "critical": True,
+            "escalated": True,
         }
 
     # ============================================================
@@ -1111,11 +1193,68 @@ class TradeEngine:
         if long_success and short_success:
             long_filled = long_order.get("filled") or 0.0
             short_filled = short_order.get("filled") or 0.0
-            
+
+            # FIX #6: Проверяем дисбаланс при exit
+            imbalance = long_filled - short_filled
+            max_expected = max(long_amount, short_amount)
+            imbalance_pct = abs(imbalance) / max_expected * 100 if max_expected > 0 else 0
+
+            if imbalance_pct > WARNING_IMBALANCE_PCT:
+                logger.warning(
+                    f"⚠️ EXIT IMBALANCE WARNING | LONG closed={long_filled}, SHORT closed={short_filled}, "
+                    f"diff={imbalance:.6f} ({imbalance_pct:.2f}%)"
+                )
+
+            # FIX #6: Критичный дисбаланс — выравниваем
+            if imbalance_pct > CRITICAL_IMBALANCE_PCT:
+                logger.error(
+                    f"🚨 EXIT CRITICAL IMBALANCE | "
+                    f"LONG closed={long_filled}, SHORT closed={short_filled}, "
+                    f"diff={imbalance:.6f} ({imbalance_pct:.2f}%) > {CRITICAL_IMBALANCE_PCT}%"
+                )
+
+                # Определяем "хвост" — какая нога закрылась меньше
+                residual_amount = abs(imbalance)
+
+                if imbalance > 0:
+                    # LONG закрыт больше, чем SHORT → SHORT недозакрыт
+                    # Нужно докупить SHORT (buy) на short_ex
+                    residual_exchange = short_ex
+                    residual_side = "buy"
+                    residual_leg = "SHORT"
+                else:
+                    # SHORT закрыт больше, чем LONG → LONG недозакрыт
+                    # Нужно допродать LONG (sell) на long_ex
+                    residual_exchange = long_ex
+                    residual_side = "sell"
+                    residual_leg = "LONG"
+
+                logger.warning(
+                    f"🔧 CLOSING EXIT RESIDUAL {residual_leg} | [{residual_exchange}] {residual_side} {residual_amount:.6f}"
+                )
+
+                close_result = await self._emergency_close_leg(
+                    exchange=residual_exchange,
+                    symbol=symbol,
+                    side=residual_side,
+                    amount=residual_amount,
+                    leg_label=f"exit_residual_{residual_leg.lower()}",
+                    pair_id=pair_id,
+                )
+
+                if close_result["critical"]:
+                    logger.critical(
+                        f"💀 EXIT RESIDUAL CLOSE FAILED | {residual_leg} {residual_amount} on {residual_exchange} | saved to emergency"
+                    )
+                else:
+                    logger.info(
+                        f"✅ EXIT RESIDUAL CLOSED | {residual_leg} {residual_amount} on {residual_exchange}"
+                    )
+
             logger.info(
                 f"EXIT SUCCESS | LONG closed={long_filled}, SHORT closed={short_filled}"
             )
-            
+
             return {
                 "success": True,
                 "exit_long_order": long_order,

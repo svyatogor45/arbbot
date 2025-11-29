@@ -9,6 +9,8 @@ from config import WSS_URLS, WS_PING_INTERVAL
 from symbol_mapper import to_ws_symbol, to_internal
 
 OrderbookCallback = Callable[[str, str, dict], Awaitable[None]]
+# FIX #5: Callback для ликвидаций (exchange, symbol, liquidation_data)
+LiquidationCallback = Callable[[str, str, dict], Awaitable[None]]
 
 def safe_levels(levels):
     result = []
@@ -38,13 +40,25 @@ RECONNECT_BACKOFF_MULTIPLIER = 1.5
 MAX_BOOK_DEPTH = 10
 RETURN_BOOK_DEPTH = 5
 
-@dataclass(frozen=True)
+@dataclass
 class OrderbookSnapshot:
+    """Orderbook snapshot with pre-computed dict for zero-copy access."""
     bids: Tuple[Tuple[float, float], ...]
     asks: Tuple[Tuple[float, float], ...]
     timestamp: float
+    _cached_dict: dict = field(default=None, repr=False, compare=False)
+
+    def __post_init__(self):
+        # Pre-compute dict once at creation - no GC pressure on reads
+        object.__setattr__(self, '_cached_dict', {
+            "bids": [list(b) for b in self.bids[:RETURN_BOOK_DEPTH]],
+            "asks": [list(a) for a in self.asks[:RETURN_BOOK_DEPTH]],
+            "timestamp": self.timestamp
+        })
+
     def to_dict(self):
-        return {"bids": [list(b) for b in self.bids[:RETURN_BOOK_DEPTH]], "asks": [list(a) for a in self.asks[:RETURN_BOOK_DEPTH]], "timestamp": self.timestamp}
+        return self._cached_dict
+
     @property
     def best_bid(self): return self.bids[0][0] if self.bids else None
     @property
@@ -90,6 +104,14 @@ class WsManager:
         self._health = {ex.lower(): ConnectionHealth(exchange=ex.lower()) for ex in active_exchanges}
         self._reconnect_attempts = {ex.lower(): 0 for ex in active_exchanges}
         self._callbacks = []
+        # FIX #5: Callbacks для ликвидаций
+        self._liquidation_callbacks: List[LiquidationCallback] = []
+        # Backpressure: latest-wins strategy for arbitrage
+        self._pending_updates: Dict[Tuple[str, str], dict] = {}  # (ex, symbol) -> snapshot_dict
+        self._pending_event = asyncio.Event()
+        self._callback_worker_task = None
+        # FIX #5: Pending liquidations для callback worker
+        self._pending_liquidations: List[Tuple[str, str, dict]] = []  # [(ex, symbol, data), ...]
         if self._allowed:
             logger.info(f"[WS] Active exchanges: {list(self._allowed)}")
 
@@ -162,23 +184,81 @@ class WsManager:
 
     def on_orderbook_update(self, cb):
         self._callbacks.append(cb)
-        logger.info(f"[WS] Callback registered")
+        logger.info(f"[WS] Orderbook callback registered")
 
     def remove_callback(self, cb):
         if cb in self._callbacks: self._callbacks.remove(cb)
+
+    # FIX #5: Методы для подписки на ликвидации
+    def on_liquidation(self, cb: LiquidationCallback):
+        """Регистрирует callback для уведомлений о ликвидациях."""
+        self._liquidation_callbacks.append(cb)
+        logger.info(f"[WS] Liquidation callback registered")
+
+    def remove_liquidation_callback(self, cb):
+        if cb in self._liquidation_callbacks:
+            self._liquidation_callbacks.remove(cb)
+
+    async def _callback_worker(self):
+        """Process callbacks with latest-wins backpressure. Old updates are dropped."""
+        while self.running:
+            try:
+                await asyncio.wait_for(self._pending_event.wait(), timeout=0.1)
+            except asyncio.TimeoutError:
+                continue
+
+            # Atomically grab all pending updates and clear
+            if not self._pending_updates and not self._pending_liquidations:
+                self._pending_event.clear()
+                continue
+
+            updates = self._pending_updates
+            self._pending_updates = {}
+
+            # FIX #5: Grab pending liquidations
+            liquidations = self._pending_liquidations
+            self._pending_liquidations = []
+
+            self._pending_event.clear()
+
+            # Process only latest update per (exchange, symbol)
+            for (ex, internal), snapshot_dict in updates.items():
+                for cb in self._callbacks:
+                    try:
+                        await cb(ex, internal, snapshot_dict)
+                    except Exception as e:
+                        logger.error(f"callback error: {e}")
+
+            # FIX #5: Process liquidation callbacks (все события важны, не latest-wins)
+            for ex, symbol, liq_data in liquidations:
+                for cb in self._liquidation_callbacks:
+                    try:
+                        await cb(ex, symbol, liq_data)
+                    except Exception as e:
+                        logger.error(f"liquidation callback error: {e}")
 
     async def start(self):
         if self.running: return
         self.running = True
         self.session = aiohttp.ClientSession()
+        # Start callback worker for backpressure handling
+        self._callback_worker_task = asyncio.create_task(self._callback_worker())
         for ex, url in WSS_URLS.items():
             if url and self._is_allowed(ex):
                 asyncio.create_task(self._connect(ex.lower(), url))
         active_count = sum(1 for ex in WSS_URLS if self._is_allowed(ex))
-        logger.info(f"WsManager v2.0 started ({active_count} exchanges)")
+        logger.info(f"WsManager v2.1 started ({active_count} exchanges, backpressure enabled)")
 
     async def stop(self):
         self.running = False
+        # Stop callback worker
+        if self._callback_worker_task:
+            self._callback_worker_task.cancel()
+            try:
+                await self._callback_worker_task
+            except asyncio.CancelledError:
+                pass
+            self._callback_worker_task = None
         for ws in list(self.connections.values()):
             try: await ws.close()
             except: pass
@@ -318,19 +398,38 @@ class WsManager:
         try:
             ws_sym = to_ws_symbol(exchange, internal_symbol)
             if exchange == "bybit":
-                await ws.send_json({"op": "subscribe", "args": [f"orderbook.50.{ws_sym}"]})
+                # Orderbook + Liquidation
+                await ws.send_json({"op": "subscribe", "args": [
+                    f"orderbook.50.{ws_sym}",
+                    f"liquidation.{ws_sym}",  # FIX #5: подписка на ликвидации
+                ]})
             elif exchange == "bitget":
+                # Orderbook
                 await ws.send_json({"op": "subscribe", "args": [{"instType": "USDT-FUTURES", "channel": "books15", "instId": internal_symbol}]})
+                # FIX #5: Liquidation (публичный канал)
+                await ws.send_json({"op": "subscribe", "args": [{"instType": "USDT-FUTURES", "channel": "liquidation", "instId": internal_symbol}]})
             elif exchange == "gate":
+                # Orderbook
                 await ws.send_json({"time": int(time.time()), "channel": "futures.order_book", "event": "subscribe", "payload": [ws_sym, "20", "0"]})
+                # FIX #5: Liquidation
+                await ws.send_json({"time": int(time.time()), "channel": "futures.liquidates", "event": "subscribe", "payload": [ws_sym]})
             elif exchange == "okx":
-                await ws.send_json({"op": "subscribe", "args": [{"channel": "books5", "instId": ws_sym}]})
+                # Orderbook + Liquidation
+                await ws.send_json({"op": "subscribe", "args": [
+                    {"channel": "books5", "instId": ws_sym},
+                    {"channel": "liquidation-orders", "instType": "SWAP"},  # FIX #5
+                ]})
             elif exchange == "mexc":
                 await ws.send_json({"method": "sub.depth.full", "param": {"symbol": ws_sym, "limit": 20}})
+                # MEXC не имеет публичного канала ликвидаций через WS
             elif exchange == "bingx":
                 await ws.send_json({"id": str(uuid.uuid4()), "reqType": "sub", "dataType": f"{ws_sym}@depth20"})
+                # FIX #5: BingX liquidation
+                await ws.send_json({"id": str(uuid.uuid4()), "reqType": "sub", "dataType": f"{ws_sym}@forceOrder"})
             elif exchange == "htx":
                 await ws.send_json({"sub": f"market.{ws_sym}.depth.step6", "id": str(uuid.uuid4())})
+                # FIX #5: HTX liquidation
+                await ws.send_json({"sub": f"market.{ws_sym}.liquidation", "id": str(uuid.uuid4())})
         except Exception as e:
             logger.warning(f"[WS:{exchange}] sub error: {e}")
 
@@ -347,16 +446,25 @@ class WsManager:
         if ex == "htx" and "ping" in data:
             if ws: await ws.send_json({"pong": data["ping"]})
             return
+        # FIX #5: Сначала проверяем, это ликвидация или orderbook
+        liq_parsed = self._parse_liquidation(ex, data, time.time())
+        if liq_parsed:
+            internal, liq_data = liq_parsed
+            logger.warning(f"🚨 LIQUIDATION [{ex}] {internal} | {liq_data}")
+            if self._liquidation_callbacks:
+                self._pending_liquidations.append((ex, internal, liq_data))
+                self._pending_event.set()
+            return
+
         parsed = self._parse_orderbook(ex, data, time.time())
         if parsed:
             internal, snapshot = parsed
             self._orderbooks[ex][internal] = snapshot
             self._health[ex].record_update((time.perf_counter() - t0) * 1000)
-            for cb in self._callbacks:
-                try:
-                    await cb(ex, internal, snapshot.to_dict())
-                except Exception as e:
-                    logger.error(f"callback error: {e}")
+            # Backpressure: queue for worker, latest-wins (overwrites old)
+            if self._callbacks:
+                self._pending_updates[(ex, internal)] = snapshot.to_dict()
+                self._pending_event.set()
 
     def _parse_orderbook(self, ex, data, ts):
         def snap(bids, asks):
@@ -431,4 +539,112 @@ class WsManager:
                 tick = data["tick"]
                 if isinstance(tick, dict):
                     return to_internal(parts[1]), snap(safe_levels(tick.get("bids", [])), safe_levels(tick.get("asks", [])))
+        return None
+
+    # FIX #5: Парсер ликвидаций
+    def _parse_liquidation(self, ex: str, data: dict, ts: float) -> Optional[Tuple[str, dict]]:
+        """
+        Парсит сообщения о ликвидациях с разных бирж.
+
+        Returns:
+            (internal_symbol, liquidation_data) или None если это не ликвидация
+
+        liquidation_data содержит:
+            - side: "buy" или "sell" (направление ликвидации)
+            - price: цена ликвидации
+            - qty: объём
+            - timestamp: время
+        """
+        try:
+            # BYBIT: {"topic":"liquidation.BTCUSDT","data":{"symbol":"BTCUSDT","side":"Sell","price":"50000","qty":"0.1",...}}
+            if ex == "bybit" and "topic" in data and "liquidation" in data.get("topic", ""):
+                liq = data.get("data", {})
+                if isinstance(liq, list) and liq:
+                    liq = liq[0]
+                if isinstance(liq, dict) and liq.get("symbol"):
+                    return to_internal(liq["symbol"]), {
+                        "side": liq.get("side", "").lower(),
+                        "price": float(liq.get("price", 0)),
+                        "qty": float(liq.get("qty", 0)),
+                        "timestamp": ts,
+                        "exchange": ex,
+                    }
+
+            # BITGET: {"arg":{"channel":"liquidation","instId":"BTCUSDT"},"data":[{"price":"50000","sz":"0.1","side":"buy",...}]}
+            if ex == "bitget":
+                arg = data.get("arg", {})
+                if arg.get("channel") == "liquidation":
+                    instId = arg.get("instId")
+                    liq_list = data.get("data", [])
+                    if instId and liq_list:
+                        liq = liq_list[0] if isinstance(liq_list, list) else liq_list
+                        return to_internal(instId), {
+                            "side": liq.get("side", "").lower(),
+                            "price": float(liq.get("price", 0) or liq.get("px", 0)),
+                            "qty": float(liq.get("sz", 0) or liq.get("qty", 0)),
+                            "timestamp": ts,
+                            "exchange": ex,
+                        }
+
+            # OKX: {"arg":{"channel":"liquidation-orders","instType":"SWAP"},"data":[{"instId":"BTC-USDT-SWAP","side":"sell","px":"50000","sz":"0.1",...}]}
+            if ex == "okx" and "arg" in data:
+                arg = data["arg"]
+                if arg.get("channel") == "liquidation-orders":
+                    liq_list = data.get("data", [])
+                    if liq_list:
+                        liq = liq_list[0] if isinstance(liq_list, list) else liq_list
+                        instId = liq.get("instId", "")
+                        return to_internal(instId), {
+                            "side": liq.get("side", "").lower(),
+                            "price": float(liq.get("px", 0) or liq.get("bkPx", 0)),
+                            "qty": float(liq.get("sz", 0)),
+                            "timestamp": ts,
+                            "exchange": ex,
+                        }
+
+            # GATE: {"channel":"futures.liquidates","event":"update","result":{"contract":"BTC_USDT","size":100,"price":"50000",...}}
+            if ex == "gate" and data.get("channel") == "futures.liquidates" and data.get("event") == "update":
+                res = data.get("result", {})
+                contract = res.get("contract")
+                if contract:
+                    # Gate размер отрицательный = short ликвидирован
+                    size = float(res.get("size", 0))
+                    return to_internal(contract), {
+                        "side": "sell" if size > 0 else "buy",
+                        "price": float(res.get("price", 0)),
+                        "qty": abs(size),
+                        "timestamp": ts,
+                        "exchange": ex,
+                    }
+
+            # BINGX: {"dataType":"BTCUSDT@forceOrder","data":{"s":"BTCUSDT","S":"SELL","p":"50000","q":"0.1",...}}
+            if ex == "bingx" and "@forceOrder" in data.get("dataType", ""):
+                liq = data.get("data", {})
+                if isinstance(liq, dict):
+                    symbol = liq.get("s") or data["dataType"].split("@")[0]
+                    return to_internal(symbol), {
+                        "side": liq.get("S", "").lower(),
+                        "price": float(liq.get("p", 0)),
+                        "qty": float(liq.get("q", 0)),
+                        "timestamp": ts,
+                        "exchange": ex,
+                    }
+
+            # HTX: {"ch":"market.btcusdt.liquidation","tick":{"side":"sell","price":"50000","amount":"0.1",...}}
+            if ex == "htx" and "liquidation" in data.get("ch", ""):
+                parts = data.get("ch", "").split(".")
+                if len(parts) >= 2:
+                    tick = data.get("tick", {})
+                    if isinstance(tick, dict):
+                        return to_internal(parts[1]), {
+                            "side": tick.get("side", "").lower(),
+                            "price": float(tick.get("price", 0)),
+                            "qty": float(tick.get("amount", 0) or tick.get("qty", 0)),
+                            "timestamp": ts,
+                            "exchange": ex,
+                        }
+
+        except Exception as e:
+            logger.debug(f"[WS:{ex}] liquidation parse error: {e}")
+
         return None

@@ -306,7 +306,8 @@ class MarketEngine:
         
         # Fallback to full check with VWAP
         start_time = time.time()
-        ex_list = [self._normalize_exchange(e) for e in exchanges] if exchanges else list(TAKER_FEES.keys())
+        # FIX #12: Используем реально активные биржи вместо статического списка
+        ex_list = [self._normalize_exchange(e) for e in exchanges] if exchanges else self.ws.get_active_exchanges()
         
         if len(ex_list) < 2:
             return None

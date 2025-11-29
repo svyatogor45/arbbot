@@ -120,6 +120,12 @@ class PairState:
     # FIX: asyncio.Lock вместо bool для атомарной защиты от race condition
     _lock: asyncio.Lock = field(default_factory=asyncio.Lock)
 
+    # FIX #1: Счётчик пропущенных проверок при stale данных
+    missed_hold_checks: int = 0
+    # FIX #6, #7: Таймауты для ENTERING и EXITING состояний
+    entering_started_at: float = 0.0
+    exiting_started_at: float = 0.0
+
     def __post_init__(self):
         self.n_orders = max(1, int(self.n_orders))
         self.part_volume = self.total_volume / self.n_orders if self.n_orders > 0 else 0.0
@@ -156,6 +162,10 @@ class PairState:
         self.actual_long_volume = 0.0
         self.actual_short_volume = 0.0
         self.status = STATE_READY
+        # FIX: Сброс новых полей
+        self.missed_hold_checks = 0
+        self.entering_started_at = 0.0
+        self.exiting_started_at = 0.0
 
 
 # ==============================
@@ -366,6 +376,14 @@ class TradingCore:
         self._circuit_breaker_threshold = 3  # errors before disable
         self._circuit_breaker_cooldown = 60.0  # seconds to disable
 
+        # FIX #10: Heartbeat monitoring для loop'ов
+        self._loop_heartbeats: Dict[str, float] = {
+            "pair_sync": time.time(),
+            "position_monitor": time.time(),
+            "position_validation": time.time(),
+            "risk_refresh": time.time(),
+        }
+
         self._initialized = False
 
     async def init(self):
@@ -433,7 +451,11 @@ class TradingCore:
         # Register callback for orderbook updates
         self.ws.on_orderbook_update(self._on_orderbook_update)
         logger.info("Orderbook callback registered")
-        
+
+        # FIX #4: Register callback for liquidation events
+        self.ws.on_liquidation(self._on_liquidation_event)
+        logger.info("Liquidation callback registered")
+
         # Restore positions from DB
         await self._restore_positions()
 
@@ -445,7 +467,8 @@ class TradingCore:
         asyncio.create_task(self._position_monitor_loop())
         asyncio.create_task(self._risk_refresh_loop())
         asyncio.create_task(self._position_validation_loop())  # FIX Problem 1
-        
+        asyncio.create_task(self._watchdog_loop())  # FIX #10: Watchdog
+
         # Wait for shutdown
         await self.shutdown_mgr.wait_for_shutdown()
         
@@ -735,13 +758,91 @@ class TradingCore:
         # Process each pair that watches this symbol
         for pair_id in list(pair_ids):
             state = self.pair_states.get(pair_id)
-            if not state or state.processing:
+            if not state:
                 continue
-            
-            # Only process READY states on market updates
-            # HOLD/ENTERING/EXITING are handled by position_monitor_loop
+
+            # FIX: Используем Lock вместо bool
+            if state._lock.locked():
+                continue
+
+            # Process READY states on market updates (entry opportunities)
             if state.status == STATE_READY:
                 asyncio.create_task(self._process_ready_state(state))
+            # FIX #11: Event-driven HOLD - мгновенная реакция на изменение спреда для TP
+            elif state.status == STATE_HOLD:
+                asyncio.create_task(self._process_hold_state_event(state))
+
+    # FIX #4: Callback для мгновенной реакции на ликвидации
+    async def _on_liquidation_event(self, exchange: str, symbol: str, liq_data: dict):
+        """
+        Callback from WsManager on liquidation events.
+        Immediately closes the remaining leg when one leg is liquidated.
+        """
+        pair_ids = self.symbol_to_pairs.get(symbol)
+        if not pair_ids:
+            return
+
+        for pair_id in list(pair_ids):
+            state = self.pair_states.get(pair_id)
+            if not state or state.open_parts <= 0:
+                continue
+
+            # Определяем какая нога была ликвидирована
+            liq_side = liq_data.get("side", "").lower()
+
+            # sell liquidation = LONG позиция ликвидирована (биржа продала нашу LONG)
+            if liq_side == "sell" and state.long_exchange == exchange:
+                logger.critical(
+                    f"[{pair_id}] LIQUIDATION EVENT: LONG on {exchange} | "
+                    f"Closing remaining SHORT on {state.short_exchange}"
+                )
+                await self.db.log_trade_event(
+                    pair_id, "LIQUIDATION_CALLBACK", "critical",
+                    f"LONG liquidated on {exchange}, closing SHORT",
+                    {"exchange": exchange, "symbol": symbol, "liq_data": liq_data}
+                )
+                try:
+                    close_result = await self.trader._emergency_close_leg(
+                        exchange=state.short_exchange,
+                        symbol=state.symbol,
+                        side="buy",
+                        amount=state.actual_short_volume,
+                        leg_label="liquidation_callback_close_short",
+                        pair_id=pair_id,
+                    )
+                    logger.info(f"[{pair_id}] Liquidation callback close SHORT result: {close_result}")
+                except Exception as e:
+                    logger.error(f"[{pair_id}] Failed to close SHORT after liquidation: {e}")
+                state.reset_after_exit()
+                state.status = STATE_ERROR
+                await self.db.update_pair_status(pair_id, "error")
+
+            # buy liquidation = SHORT позиция ликвидирована (биржа купила нашу SHORT)
+            elif liq_side == "buy" and state.short_exchange == exchange:
+                logger.critical(
+                    f"[{pair_id}] LIQUIDATION EVENT: SHORT on {exchange} | "
+                    f"Closing remaining LONG on {state.long_exchange}"
+                )
+                await self.db.log_trade_event(
+                    pair_id, "LIQUIDATION_CALLBACK", "critical",
+                    f"SHORT liquidated on {exchange}, closing LONG",
+                    {"exchange": exchange, "symbol": symbol, "liq_data": liq_data}
+                )
+                try:
+                    close_result = await self.trader._emergency_close_leg(
+                        exchange=state.long_exchange,
+                        symbol=state.symbol,
+                        side="sell",
+                        amount=state.actual_long_volume,
+                        leg_label="liquidation_callback_close_long",
+                        pair_id=pair_id,
+                    )
+                    logger.info(f"[{pair_id}] Liquidation callback close LONG result: {close_result}")
+                except Exception as e:
+                    logger.error(f"[{pair_id}] Failed to close LONG after liquidation: {e}")
+                state.reset_after_exit()
+                state.status = STATE_ERROR
+                await self.db.update_pair_status(pair_id, "error")
 
     async def _process_ready_state(self, state: PairState):
         """Process a READY state pair when market data updates."""
@@ -756,6 +857,22 @@ class TradingCore:
                 )
             except Exception as e:
                 logger.error(f"[{state.pair_id}] Error in ready state: {e}")
+            finally:
+                state.last_process_time = time.time()
+
+    # FIX #11: Event-driven обработка HOLD состояния
+    async def _process_hold_state_event(self, state: PairState):
+        """Process a HOLD state pair when market data updates (for faster TP detection)."""
+        if state._lock.locked():
+            return
+        async with state._lock:
+            try:
+                await handle_state_hold(
+                    self.db, self.market, self.trader,
+                    None, state, core=self
+                )
+            except Exception as e:
+                logger.error(f"[{state.pair_id}] Error in hold state event: {e}")
             finally:
                 state.last_process_time = time.time()
 
@@ -860,6 +977,9 @@ class TradingCore:
         """Background task to sync active pairs and exchanges from database."""
         while not self.shutdown_mgr.is_shutdown_requested:
             try:
+                # FIX #10: Heartbeat update
+                self._loop_heartbeats["pair_sync"] = time.time()
+
                 # ============================================================
                 # SYNC EXCHANGES (hot-reload new exchanges)
                 # ============================================================
@@ -967,6 +1087,9 @@ class TradingCore:
         """Background task to monitor open positions for TP/SL."""
         while not self.shutdown_mgr.is_shutdown_requested:
             try:
+                # FIX #10: Heartbeat update
+                self._loop_heartbeats["position_monitor"] = time.time()
+
                 for state in list(self.pair_states.values()):
                     # FIX: Используем Lock вместо bool
                     if state._lock.locked():
@@ -978,11 +1101,11 @@ class TradingCore:
 
                     elif state.status == STATE_HOLD:
                         async with state._lock:
-                            await handle_state_hold(self.db, self.market, self.trader, None, state)
+                            await handle_state_hold(self.db, self.market, self.trader, None, state, core=self)
 
                     elif state.status == STATE_EXITING:
                         async with state._lock:
-                            await handle_state_exiting(self.db, self.market, self.trader, None, state)
+                            await handle_state_exiting(self.db, self.market, self.trader, None, state, core=self)
 
             except Exception as e:
                 logger.error(f"Error in position monitor loop: {e}")
@@ -993,6 +1116,8 @@ class TradingCore:
         """Background task to refresh risk limits."""
         while not self.shutdown_mgr.is_shutdown_requested:
             try:
+                # FIX #10: Heartbeat update
+                self._loop_heartbeats["risk_refresh"] = time.time()
                 await self.risk_controller.refresh_from_state(self.pair_states)
             except Exception as e:
                 logger.error(f"Error refreshing risk: {e}")
@@ -1011,6 +1136,8 @@ class TradingCore:
         while not self.shutdown_mgr.is_shutdown_requested:
             try:
                 await asyncio.sleep(POSITION_VALIDATION_INTERVAL)
+                # FIX #10: Heartbeat update
+                self._loop_heartbeats["position_validation"] = time.time()
 
                 if not self.pair_states:
                     continue
@@ -1070,16 +1197,35 @@ class TradingCore:
                         long_missing = real_long_size < expected_long * 0.5
                         short_missing = real_short_size < expected_short * 0.5
 
+                        # FIX #5: Auto-close оставшейся ноги при single-leg liquidation
                         if long_missing and not short_missing:
                             logger.critical(
                                 f"[VALIDATION] LONG LEG MISSING pair={pair_id} {state.symbol} | "
-                                f"Real LONG={real_long_size:.4f}, Expected={expected_long:.4f}"
+                                f"Real LONG={real_long_size:.4f}, Expected={expected_long:.4f} | "
+                                f"AUTO-CLOSING SHORT"
                             )
                             await self.db.log_trade_event(
                                 pair_id, "LONG_LEG_MISSING", "critical",
-                                "Long leg liquidated/closed, SHORT still open - MANUAL INTERVENTION REQUIRED",
+                                "Long leg liquidated/closed - AUTO-CLOSING SHORT",
                                 {"expected_long": expected_long, "real_long": real_long_size}
                             )
+                            # Закрываем оставшуюся SHORT ногу
+                            try:
+                                close_result = await self.trader._emergency_close_leg(
+                                    exchange=state.short_exchange,
+                                    symbol=state.symbol,
+                                    side="buy",  # buy to close short
+                                    amount=real_short_size,
+                                    leg_label="emergency_close_short_after_long_liquidation",
+                                    pair_id=pair_id,
+                                )
+                                if close_result.get("success"):
+                                    logger.info(f"[VALIDATION] SHORT leg closed successfully for pair={pair_id}")
+                                else:
+                                    logger.error(f"[VALIDATION] Failed to close SHORT: {close_result}")
+                            except Exception as close_err:
+                                logger.error(f"[VALIDATION] Exception closing SHORT: {close_err}")
+                            state.reset_after_exit()
                             state.status = STATE_ERROR
                             await self.db.update_pair_status(pair_id, "error")
                             continue
@@ -1087,13 +1233,31 @@ class TradingCore:
                         if short_missing and not long_missing:
                             logger.critical(
                                 f"[VALIDATION] SHORT LEG MISSING pair={pair_id} {state.symbol} | "
-                                f"Real SHORT={real_short_size:.4f}, Expected={expected_short:.4f}"
+                                f"Real SHORT={real_short_size:.4f}, Expected={expected_short:.4f} | "
+                                f"AUTO-CLOSING LONG"
                             )
                             await self.db.log_trade_event(
                                 pair_id, "SHORT_LEG_MISSING", "critical",
-                                "Short leg liquidated/closed, LONG still open - MANUAL INTERVENTION REQUIRED",
+                                "Short leg liquidated/closed - AUTO-CLOSING LONG",
                                 {"expected_short": expected_short, "real_short": real_short_size}
                             )
+                            # Закрываем оставшуюся LONG ногу
+                            try:
+                                close_result = await self.trader._emergency_close_leg(
+                                    exchange=state.long_exchange,
+                                    symbol=state.symbol,
+                                    side="sell",  # sell to close long
+                                    amount=real_long_size,
+                                    leg_label="emergency_close_long_after_short_liquidation",
+                                    pair_id=pair_id,
+                                )
+                                if close_result.get("success"):
+                                    logger.info(f"[VALIDATION] LONG leg closed successfully for pair={pair_id}")
+                                else:
+                                    logger.error(f"[VALIDATION] Failed to close LONG: {close_result}")
+                            except Exception as close_err:
+                                logger.error(f"[VALIDATION] Exception closing LONG: {close_err}")
+                            state.reset_after_exit()
                             state.status = STATE_ERROR
                             await self.db.update_pair_status(pair_id, "error")
                             continue
@@ -1122,6 +1286,29 @@ class TradingCore:
 
             except Exception as e:
                 logger.error(f"Error in position validation loop: {e}")
+
+    # FIX #10: Watchdog loop для мониторинга heartbeat'ов
+    async def _watchdog_loop(self):
+        """Watchdog to detect frozen/dead loops."""
+        WATCHDOG_TIMEOUT = 120  # 2 минуты без heartbeat = проблема
+        while not self.shutdown_mgr.is_shutdown_requested:
+            try:
+                now = time.time()
+                for loop_name, last_beat in self._loop_heartbeats.items():
+                    age = now - last_beat
+                    if age > WATCHDOG_TIMEOUT:
+                        logger.critical(
+                            f"⚠️ WATCHDOG: {loop_name} not responding for {age:.0f}s! "
+                            f"Last heartbeat: {WATCHDOG_TIMEOUT}s ago"
+                        )
+                        await self.db.log_trade_event(
+                            0, "WATCHDOG_ALERT", "critical",
+                            f"Loop {loop_name} not responding",
+                            {"loop": loop_name, "last_heartbeat_age": age}
+                        )
+            except Exception as e:
+                logger.error(f"Error in watchdog loop: {e}")
+            await asyncio.sleep(30)  # Проверка каждые 30 секунд
 
 
 # ==============================
@@ -1295,6 +1482,8 @@ async def handle_state_ready(
                 f"Entry error: {error_code}", {"symbol": symbol}))
 
 
+ENTERING_TIMEOUT = 300  # 5 минут таймаут для ENTERING состояния
+
 async def handle_state_entering(
     db: DBManager,
     market: MarketEngine,
@@ -1304,11 +1493,44 @@ async def handle_state_entering(
 ):
     """ENTERING state: add more parts while spread is good."""
     if state.is_fully_entered:
+        state.entering_started_at = 0.0  # Сбросить таймер
         state.status = STATE_HOLD
         return
 
     if not state.long_exchange or not state.short_exchange:
         state.status = STATE_ERROR
+        return
+
+    # FIX #6: Таймаут ENTERING с Force Close
+    if state.entering_started_at == 0.0:
+        state.entering_started_at = time.time()
+
+    if time.time() - state.entering_started_at > ENTERING_TIMEOUT:
+        logger.critical(
+            f"[{state.pair_id}] ENTERING TIMEOUT ({ENTERING_TIMEOUT}s) - FORCE CLOSING"
+        )
+        await db.log_trade_event(
+            state.pair_id, "ENTERING_TIMEOUT", "critical",
+            f"Entering timeout after {ENTERING_TIMEOUT}s, force closing",
+            {"filled_parts": state.filled_parts, "n_orders": state.n_orders}
+        )
+        # Принудительное закрытие всех открытых позиций
+        if state.filled_parts > 0 and state.actual_long_volume > 0:
+            position_info = {
+                "symbol": state.symbol,
+                "long_exchange": state.long_exchange,
+                "short_exchange": state.short_exchange,
+                "pair_id": state.pair_id,
+                "actual_long_volume": state.actual_long_volume,
+                "actual_short_volume": state.actual_short_volume,
+            }
+            try:
+                await trader.execute_exit(position_info, state.open_volume)
+            except Exception as e:
+                logger.error(f"[{state.pair_id}] Force close on ENTERING timeout failed: {e}")
+        state.reset_after_exit()
+        state.status = STATE_ERROR
+        await db.update_pair_status(state.pair_id, "error")
         return
 
     symbol = state.symbol
@@ -1381,6 +1603,7 @@ async def handle_state_hold(
     trader: TradeEngine,
     pair_row: dict,
     state: PairState,
+    core: "TradingCore" = None,  # FIX #3: для проверки circuit breaker
 ):
     """HOLD state: monitor for TP/SL."""
     if state.open_parts <= 0:
@@ -1391,6 +1614,12 @@ async def handle_state_hold(
     if not state.long_exchange or not state.short_exchange:
         state.status = STATE_ERROR
         return
+
+    # FIX #3: Circuit Breaker check for HOLD state
+    if core:
+        if core.circuit_breaker_is_open(state.long_exchange) or core.circuit_breaker_is_open(state.short_exchange):
+            logger.warning(f"[{state.pair_id}] HOLD: Circuit breaker open, skipping check")
+            return
 
     symbol = state.symbol
     open_volume = state.open_volume
@@ -1404,8 +1633,38 @@ async def handle_state_hold(
         short_exchange=state.short_exchange,
         volume_in_coin=open_volume,
     )
+
+    # FIX #1: Счётчик пропущенных проверок при stale данных
     if not pos_prices or not pos_prices["valid"]:
+        state.missed_hold_checks += 1
+        if state.missed_hold_checks >= 20:  # 10 секунд при 0.5с интервале
+            logger.critical(
+                f"[{state.pair_id}] STALE DATA ESCALATION: {state.missed_hold_checks} missed checks | "
+                f"FORCE CLOSING position"
+            )
+            await db.log_trade_event(
+                state.pair_id, "STALE_DATA_ESCALATION", "critical",
+                f"Force closing due to {state.missed_hold_checks} missed checks",
+                {"missed_checks": state.missed_hold_checks}
+            )
+            # Принудительное закрытие позиции
+            position_info = {
+                "symbol": symbol,
+                "long_exchange": state.long_exchange,
+                "short_exchange": state.short_exchange,
+                "pair_id": state.pair_id,
+                "actual_long_volume": state.actual_long_volume,
+                "actual_short_volume": state.actual_short_volume,
+            }
+            try:
+                await trader.execute_exit(position_info, open_volume)
+            except Exception as e:
+                logger.error(f"[{state.pair_id}] Force close failed: {e}")
+            state.reset_after_exit()
+            state.status = STATE_ERROR
+            await db.update_pair_status(state.pair_id, "error")
         return
+    state.missed_hold_checks = 0  # Сбросить счётчик при успехе
 
     long_exit_price = pos_prices["long_exit_price"]
     short_exit_price = pos_prices["short_exit_price"]
@@ -1457,15 +1716,19 @@ async def handle_state_hold(
         state.status = STATE_EXITING
 
 
+EXITING_TIMEOUT = 300  # 5 минут таймаут для EXITING состояния
+
 async def handle_state_exiting(
     db: DBManager,
     market: MarketEngine,
     trader: TradeEngine,
     pair_row: dict,
     state: PairState,
+    core: "TradingCore" = None,  # FIX #3: для проверки circuit breaker
 ):
     """EXITING state: close position in parts."""
     if state.open_parts <= 0:
+        state.exiting_started_at = 0.0  # Сбросить таймер
         await finalize_full_exit(db, market, state)
         return
 
@@ -1473,8 +1736,52 @@ async def handle_state_exiting(
         state.status = STATE_ERROR
         return
 
+    # FIX #3: Circuit Breaker check for EXITING state
+    if core:
+        if core.circuit_breaker_is_open(state.long_exchange) or core.circuit_breaker_is_open(state.short_exchange):
+            logger.warning(f"[{state.pair_id}] EXITING: Circuit breaker open, waiting for recovery")
+            return
+
+    # FIX #7: Таймаут EXITING с Force Close
+    if state.exiting_started_at == 0.0:
+        state.exiting_started_at = time.time()
+
     symbol = state.symbol
     volume_to_close = state.part_volume
+
+    # Проверка таймаута - принудительное закрытие БЕЗ проверки спреда
+    if time.time() - state.exiting_started_at > EXITING_TIMEOUT:
+        logger.critical(
+            f"[{state.pair_id}] EXITING TIMEOUT ({EXITING_TIMEOUT}s) - FORCE MARKET CLOSE"
+        )
+        await db.log_trade_event(
+            state.pair_id, "EXITING_TIMEOUT", "critical",
+            f"Exiting timeout after {EXITING_TIMEOUT}s, force market close",
+            {"open_parts": state.open_parts, "volume": volume_to_close}
+        )
+        # Принудительное закрытие без проверки спреда
+        position_info = {
+            "symbol": symbol,
+            "long_exchange": state.long_exchange,
+            "short_exchange": state.short_exchange,
+            "pair_id": state.pair_id,
+            "actual_long_volume": state.actual_long_volume,
+            "actual_short_volume": state.actual_short_volume,
+        }
+        try:
+            res = await trader.execute_exit(position_info, state.open_volume)
+            if res["success"]:
+                state.exiting_started_at = 0.0
+                await finalize_full_exit(db, market, state)
+            else:
+                logger.error(f"[{state.pair_id}] Force close failed: {res}")
+                state.status = STATE_ERROR
+                await db.update_pair_status(state.pair_id, "error")
+        except Exception as e:
+            logger.error(f"[{state.pair_id}] Force close exception: {e}")
+            state.status = STATE_ERROR
+            await db.update_pair_status(state.pair_id, "error")
+        return
 
     signal = await market.check_spread(
         symbol=symbol,

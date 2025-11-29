@@ -768,6 +768,31 @@ class TradeEngine:
             base, quote = symbol, "USDT"
 
         # ------------------------------------------------------------
+        # FIX #2: Double Entry Prevention - проверка существующих позиций
+        # ------------------------------------------------------------
+        try:
+            long_position = await self.manager.get_position(long_ex, symbol)
+            short_position = await self.manager.get_position(short_ex, symbol)
+
+            long_contracts = abs(float(long_position.get("contracts", 0))) if long_position else 0.0
+            short_contracts = abs(float(short_position.get("contracts", 0))) if short_position else 0.0
+
+            if long_contracts > 0 or short_contracts > 0:
+                logger.error(
+                    f"❌ ENTRY BLOCKED {symbol} | Позиции уже существуют: "
+                    f"[{long_ex}] LONG={long_contracts:.6f}, [{short_ex}] SHORT={short_contracts:.6f}"
+                )
+                return {
+                    "success": False,
+                    "entry_long_order": None,
+                    "entry_short_order": None,
+                    "error": "existing_positions_detected",
+                    "imbalance": None,
+                }
+        except Exception as e:
+            logger.warning(f"⚠ Не удалось проверить позиции перед входом: {e}. Продолжаем.")
+
+        # ------------------------------------------------------------
         # Проверка минимального размера ордера
         # ------------------------------------------------------------
         min_ok_long, min_reason_long, min_amount_long = await self._check_min_order_size(

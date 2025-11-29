@@ -27,7 +27,13 @@ from symbol_mapper import to_ccxt_symbol, pretty
 # ============================================================
 
 # Время жизни кэша market info (секунды)
-MARKET_INFO_CACHE_TTL = 300  # 5 минут
+MARKET_INFO_CACHE_TTL = 3600  # 1 час (ОПТИМИЗАЦИЯ: было 300, увеличено согласно отчету)
+
+# Время жизни кэша позиций (секунды)
+POSITION_CACHE_TTL = 2.0  # 2 секунды (ОПТИМИЗАЦИЯ: для арбитража - критически важно)
+
+# Время жизни кэша балансов (секунды)
+BALANCE_CACHE_TTL = 10.0  # 10 секунд (ОПТИМИЗАЦИЯ: баланс не меняется между проверкой и ордером)
 
 # Интервал health check (секунды)
 HEALTH_CHECK_INTERVAL = 60
@@ -125,16 +131,22 @@ class ExchangeManager:
     def __init__(self, credentials_provider: Optional[Callable[[str], Dict[str, Any]]] = None):
         # Кеш активных инстансов бирж: { "bybit": <ccxt.bybit>, ... }
         self.active_exchanges: Dict[str, Any] = {}
-        
+
         # Функция для получения credentials
         self.credentials_provider = credentials_provider
-        
+
         # Кэш market info: { "bybit:BTC/USDT:USDT": CachedMarketInfo, ... }
         self._market_info_cache: Dict[str, CachedMarketInfo] = {}
-        
+
+        # ОПТИМИЗАЦИЯ: Кэш позиций - { (exchange, symbol): (position, timestamp) }
+        self._position_cache: Dict[Tuple[str, str], Tuple[Optional[Dict], float]] = {}
+
+        # ОПТИМИЗАЦИЯ: Кэш балансов - { (exchange, currency): (balance, timestamp) }
+        self._balance_cache: Dict[Tuple[str, str], Tuple[float, float]] = {}
+
         # Метрики здоровья по биржам
         self._health: Dict[str, ExchangeHealth] = {}
-        
+
         # Lock для thread-safe создания инстансов
         self._create_lock = asyncio.Lock()
 

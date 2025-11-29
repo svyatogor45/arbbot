@@ -1,0 +1,22 @@
+# Базы данных
+*.db
+*.sqlite
+*.sqlite3
+
+# Логи
+*.log
+logs/
+
+# Переменные окружения (пароли, ключи)
+.env
+.env.local
+
+# Зависимости
+node_modules/
+__pycache__/
+venv/
+
+# Временные файлы
+*.tmp
+*.temp
+.cache/

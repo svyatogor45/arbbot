@@ -1,0 +1,362 @@
+<!DOCTYPE html>
+<html lang="ru">
+<head>
+    <meta charset="UTF-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1.0">
+    <title>ARB Terminal</title>
+    <link rel="stylesheet" href="/static/css/styles.css">
+    <link rel="preconnect" href="https://fonts.googleapis.com">
+    <link rel="preconnect" href="https://fonts.gstatic.com" crossorigin>
+    <link href="https://fonts.googleapis.com/css2?family=Inter:wght@400;500;600;700&display=swap" rel="stylesheet">
+</head>
+<body>
+    <!-- Header -->
+    <header class="header">
+        <div class="header-left">
+            <div class="logo">
+                <span class="logo-icon">A</span>
+                <span class="logo-text">ARB Terminal</span>
+            </div>
+        </div>
+        <div class="header-center">
+            <div class="balances" id="balances-bar">
+                <!-- Balances will be inserted here -->
+            </div>
+        </div>
+        <div class="header-right">
+            <div class="connection-status" id="connection-status">
+                <span class="status-dot offline"></span>
+                <span class="status-text">Offline</span>
+            </div>
+        </div>
+    </header>
+
+    <!-- Navigation Tabs -->
+    <nav class="tabs">
+        <button class="tab active" data-tab="bot">
+            <svg class="tab-icon" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2">
+                <path d="M12 2L2 7l10 5 10-5-10-5zM2 17l10 5 10-5M2 12l10 5 10-5"/>
+            </svg>
+            <span>Bot</span>
+        </button>
+        <button class="tab" data-tab="api-stats">
+            <svg class="tab-icon" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2">
+                <path d="M18 20V10M12 20V4M6 20v-6"/>
+            </svg>
+            <span>API / Stats</span>
+        </button>
+        <button class="tab" data-tab="settings">
+            <svg class="tab-icon" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2">
+                <circle cx="12" cy="12" r="3"/>
+                <path d="M12 1v6m0 10v6M4.22 4.22l4.24 4.24m7.08 7.08l4.24 4.24M1 12h6m10 0h6M4.22 19.78l4.24-4.24m7.08-7.08l4.24-4.24"/>
+            </svg>
+            <span>Settings</span>
+        </button>
+    </nav>
+
+    <!-- Main Content -->
+    <main class="main-content">
+        <!-- BOT TAB -->
+        <section class="tab-content active" id="tab-bot">
+            <div class="section-header">
+                <div class="pairs-info">
+                    <span id="pairs-count">0</span> / 30 pairs
+                    <span class="separator">|</span>
+                    <span id="active-count">0</span> active
+                </div>
+                <button class="btn btn-primary" id="btn-add-pair">
+                    <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2">
+                        <line x1="12" y1="5" x2="12" y2="19"/>
+                        <line x1="5" y1="12" x2="19" y2="12"/>
+                    </svg>
+                    Add Pair
+                </button>
+            </div>
+
+            <!-- Pairs Grid -->
+            <div class="pairs-grid" id="pairs-grid">
+                <!-- Pair cards will be inserted here -->
+            </div>
+
+            <!-- Empty State -->
+            <div class="empty-state" id="empty-pairs">
+                <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.5">
+                    <path d="M12 2L2 7l10 5 10-5-10-5zM2 17l10 5 10-5M2 12l10 5 10-5"/>
+                </svg>
+                <h3>No trading pairs</h3>
+                <p>Add your first pair to start arbitrage trading</p>
+            </div>
+        </section>
+
+        <!-- API/STATS TAB -->
+        <section class="tab-content" id="tab-api-stats">
+            <!-- API Section -->
+            <div class="section">
+                <h2 class="section-title">
+                    <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2">
+                        <path d="M15 7h3a5 5 0 0 1 5 5 5 5 0 0 1-5 5h-3m-6 0H6a5 5 0 0 1-5-5 5 5 0 0 1 5-5h3"/>
+                        <line x1="8" y1="12" x2="16" y2="12"/>
+                    </svg>
+                    Exchange Connections
+                </h2>
+                <div class="exchanges-grid" id="exchanges-grid">
+                    <!-- Exchange cards will be inserted here -->
+                </div>
+            </div>
+
+            <!-- Stats Section -->
+            <div class="section">
+                <h2 class="section-title">
+                    <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2">
+                        <path d="M18 20V10M12 20V4M6 20v-6"/>
+                    </svg>
+                    Statistics
+                    <button class="btn btn-small btn-ghost" id="btn-reset-stats">Reset</button>
+                </h2>
+
+                <div class="stats-grid">
+                    <div class="stat-card">
+                        <div class="stat-label">Total Trades</div>
+                        <div class="stat-value" id="stat-trades">0</div>
+                    </div>
+                    <div class="stat-card">
+                        <div class="stat-label">Total PnL</div>
+                        <div class="stat-value" id="stat-pnl">$0.00</div>
+                    </div>
+                    <div class="stat-card">
+                        <div class="stat-label">Stop Losses</div>
+                        <div class="stat-value" id="stat-sl">0</div>
+                    </div>
+                    <div class="stat-card">
+                        <div class="stat-label">Liquidations</div>
+                        <div class="stat-value" id="stat-liq">0</div>
+                    </div>
+                </div>
+
+                <!-- Top Lists -->
+                <div class="top-lists">
+                    <div class="top-list">
+                        <h3>Top Profitable</h3>
+                        <div class="top-list-items" id="top-profitable">
+                            <div class="empty-list">No data</div>
+                        </div>
+                    </div>
+                    <div class="top-list">
+                        <h3>Top Losing</h3>
+                        <div class="top-list-items" id="top-losing">
+                            <div class="empty-list">No data</div>
+                        </div>
+                    </div>
+                    <div class="top-list">
+                        <h3>Most Active</h3>
+                        <div class="top-list-items" id="top-active">
+                            <div class="empty-list">No data</div>
+                        </div>
+                    </div>
+                </div>
+            </div>
+        </section>
+
+        <!-- SETTINGS TAB -->
+        <section class="tab-content" id="tab-settings">
+            <div class="section">
+                <h2 class="section-title">
+                    <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2">
+                        <circle cx="12" cy="12" r="3"/>
+                        <path d="M12 1v6m0 10v6M4.22 4.22l4.24 4.24m7.08 7.08l4.24 4.24M1 12h6m10 0h6M4.22 19.78l4.24-4.24m7.08-7.08l4.24-4.24"/>
+                    </svg>
+                    Bot Settings
+                </h2>
+
+                <div class="settings-form">
+                    <div class="setting-item">
+                        <div class="setting-info">
+                            <label>Max Open Positions</label>
+                            <span class="setting-desc">Maximum concurrent arbitrage positions</span>
+                        </div>
+                        <div class="setting-control">
+                            <input type="number" id="setting-max-positions" min="1" max="20" value="5">
+                        </div>
+                    </div>
+
+                    <div class="setting-item">
+                        <div class="setting-info">
+                            <label>Default Leverage</label>
+                            <span class="setting-desc">Default leverage for new pairs</span>
+                        </div>
+                        <div class="setting-control">
+                            <input type="number" id="setting-leverage" min="1" max="100" value="10">
+                            <span class="setting-suffix">x</span>
+                        </div>
+                    </div>
+
+                    <div class="setting-item">
+                        <div class="setting-info">
+                            <label>Max Monitored Pairs</label>
+                            <span class="setting-desc">Maximum pairs to monitor simultaneously</span>
+                        </div>
+                        <div class="setting-control">
+                            <input type="number" id="setting-max-pairs" min="1" max="50" value="30">
+                        </div>
+                    </div>
+
+                    <div class="settings-actions">
+                        <button class="btn btn-primary" id="btn-save-settings">Save Settings</button>
+                    </div>
+                </div>
+            </div>
+
+            <!-- System Info -->
+            <div class="section">
+                <h2 class="section-title">
+                    <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2">
+                        <circle cx="12" cy="12" r="10"/>
+                        <line x1="12" y1="16" x2="12" y2="12"/>
+                        <line x1="12" y1="8" x2="12.01" y2="8"/>
+                    </svg>
+                    System Info
+                </h2>
+                <div class="system-info">
+                    <div class="info-row">
+                        <span class="info-label">Version</span>
+                        <span class="info-value">1.0.0</span>
+                    </div>
+                    <div class="info-row">
+                        <span class="info-label">Connected Exchanges</span>
+                        <span class="info-value" id="info-exchanges">0</span>
+                    </div>
+                    <div class="info-row">
+                        <span class="info-label">Active Pairs</span>
+                        <span class="info-value" id="info-active-pairs">0</span>
+                    </div>
+                    <div class="info-row">
+                        <span class="info-label">WebSocket</span>
+                        <span class="info-value" id="info-ws-status">Disconnected</span>
+                    </div>
+                </div>
+            </div>
+        </section>
+    </main>
+
+    <!-- Modal: Add/Edit Pair -->
+    <div class="modal" id="modal-pair">
+        <div class="modal-backdrop"></div>
+        <div class="modal-content">
+            <div class="modal-header">
+                <h2 id="modal-pair-title">Add New Pair</h2>
+                <button class="modal-close" id="modal-pair-close">&times;</button>
+            </div>
+            <form class="modal-body" id="form-pair">
+                <input type="hidden" id="pair-edit-id">
+
+                <div class="form-group">
+                    <label for="pair-symbol">Trading Pair</label>
+                    <input type="text" id="pair-symbol" placeholder="BTCUSDT" required>
+                    <span class="form-hint">Symbol without slash (e.g., BTCUSDT, ETHUSDT)</span>
+                </div>
+
+                <div class="form-row">
+                    <div class="form-group">
+                        <label for="pair-volume">Volume</label>
+                        <input type="number" id="pair-volume" step="0.0001" min="0.0001" placeholder="0.1" required>
+                        <span class="form-hint">Position size in base asset</span>
+                    </div>
+                    <div class="form-group">
+                        <label for="pair-orders">N Orders</label>
+                        <input type="number" id="pair-orders" min="1" max="10" value="1" required>
+                        <span class="form-hint">Split into parts</span>
+                    </div>
+                </div>
+
+                <div class="form-row">
+                    <div class="form-group">
+                        <label for="pair-entry">Entry Spread %</label>
+                        <input type="number" id="pair-entry" step="0.01" min="0.01" placeholder="1.0" required>
+                        <span class="form-hint">Min spread to enter</span>
+                    </div>
+                    <div class="form-group">
+                        <label for="pair-exit">Exit Spread %</label>
+                        <input type="number" id="pair-exit" step="0.01" min="0" placeholder="0.2" required>
+                        <span class="form-hint">Target spread to exit</span>
+                    </div>
+                </div>
+
+                <div class="form-row">
+                    <div class="form-group">
+                        <label for="pair-sl">Stop Loss (USDT)</label>
+                        <input type="number" id="pair-sl" step="1" min="0" placeholder="100">
+                        <span class="form-hint">Optional, max loss</span>
+                    </div>
+                    <div class="form-group">
+                        <label for="pair-leverage">Leverage</label>
+                        <input type="number" id="pair-leverage" min="1" max="100" value="10" required>
+                        <span class="form-hint">1-100x</span>
+                    </div>
+                </div>
+
+                <div class="modal-actions">
+                    <button type="button" class="btn btn-ghost" id="btn-cancel-pair">Cancel</button>
+                    <button type="submit" class="btn btn-primary" id="btn-submit-pair">Add Pair</button>
+                </div>
+            </form>
+        </div>
+    </div>
+
+    <!-- Modal: Connect Exchange -->
+    <div class="modal" id="modal-exchange">
+        <div class="modal-backdrop"></div>
+        <div class="modal-content">
+            <div class="modal-header">
+                <h2 id="modal-exchange-title">Connect Exchange</h2>
+                <button class="modal-close" id="modal-exchange-close">&times;</button>
+            </div>
+            <form class="modal-body" id="form-exchange">
+                <input type="hidden" id="exchange-name">
+
+                <div class="form-group">
+                    <label for="exchange-api-key">API Key</label>
+                    <input type="text" id="exchange-api-key" required autocomplete="off">
+                </div>
+
+                <div class="form-group">
+                    <label for="exchange-secret">Secret Key</label>
+                    <input type="password" id="exchange-secret" required autocomplete="off">
+                </div>
+
+                <div class="form-group" id="exchange-passphrase-group" style="display: none;">
+                    <label for="exchange-passphrase">Passphrase</label>
+                    <input type="password" id="exchange-passphrase" autocomplete="off">
+                    <span class="form-hint">Required for some exchanges (e.g., OKX)</span>
+                </div>
+
+                <div class="modal-actions">
+                    <button type="button" class="btn btn-ghost" id="btn-cancel-exchange">Cancel</button>
+                    <button type="submit" class="btn btn-primary">Connect</button>
+                </div>
+            </form>
+        </div>
+    </div>
+
+    <!-- Modal: Confirm -->
+    <div class="modal" id="modal-confirm">
+        <div class="modal-backdrop"></div>
+        <div class="modal-content modal-small">
+            <div class="modal-header">
+                <h2 id="confirm-title">Confirm</h2>
+            </div>
+            <div class="modal-body">
+                <p id="confirm-message">Are you sure?</p>
+            </div>
+            <div class="modal-actions">
+                <button class="btn btn-ghost" id="btn-confirm-cancel">Cancel</button>
+                <button class="btn btn-danger" id="btn-confirm-ok">Confirm</button>
+            </div>
+        </div>
+    </div>
+
+    <!-- Toast Container -->
+    <div class="toast-container" id="toast-container"></div>
+
+    <script src="/static/js/app.js"></script>
+</body>
+</html>

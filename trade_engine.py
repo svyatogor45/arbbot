@@ -266,13 +266,20 @@ class TradeEngine:
 
         Успехом считаем любой статус, отличающийся от "error".
 
+        FIX: Перед retry проверяем позицию на бирже — если ордер уже исполнился,
+        не делаем повторный (предотвращает удвоение позиции при network timeout).
+
         Используется для:
           - открытия ног (entry_long / entry_short)
           - аварийного закрытия (emergency_close_long)
           - дожимания ног при выходе (exit_long_retry / exit_short_retry)
         """
         last_result: Optional[OrderResult] = None
-        
+
+        # FIX: Запоминаем позицию ДО первого ордера для детекции исполнения
+        position_before = await self.manager.get_position(exchange, symbol)
+        contracts_before = abs(float(position_before.get("contracts", 0))) if position_before else 0.0
+
         for attempt in range(1, self.retry_attempts + 1):
             res = await self._order(exchange, symbol, side, amount, params=params)
             last_result = res
@@ -282,14 +289,14 @@ class TradeEngine:
                 filled = res.get("filled")
                 if filled is not None and amount > 0:
                     fill_ratio = filled / amount
-                    
+
                     if fill_ratio < PARTIAL_FILL_WARNING_RATIO:
                         logger.warning(
                             f"⚠️ PARTIAL FILL [{exchange}] {symbol} {side} "
                             f"| requested={amount}, filled={filled} "
                             f"| ratio={fill_ratio:.2%}"
                         )
-                
+
                 logger.info(
                     f"✅ ORDER OK [{exchange}] {symbol} {side} {amount} "
                     f"| leg={leg_label} | attempt={attempt} "
@@ -299,7 +306,7 @@ class TradeEngine:
 
             # Определяем, стоит ли ретраить
             error_msg = res.get("msg") or ""
-            
+
             # Некоторые ошибки не имеет смысла ретраить
             non_retryable_errors = [
                 "insufficient_funds",
@@ -307,9 +314,9 @@ class TradeEngine:
                 "below_min",
                 "auth_error",
             ]
-            
+
             is_retryable = not any(err in error_msg.lower() for err in non_retryable_errors)
-            
+
             if not is_retryable:
                 logger.error(
                     f"🛑 ORDER FAILED (non-retryable) [{exchange}] {symbol} {side} {amount} "
@@ -317,8 +324,27 @@ class TradeEngine:
                 )
                 return res
 
-            # Если ошибка и ещё есть попытки — подождать с exponential backoff
+            # FIX: Перед retry проверяем, не исполнился ли ордер на бирже
             if attempt < self.retry_attempts:
+                position_after = await self.manager.get_position(exchange, symbol)
+                contracts_after = abs(float(position_after.get("contracts", 0))) if position_after else 0.0
+
+                # Если позиция изменилась на ~amount — ордер уже исполнился
+                position_change = abs(contracts_after - contracts_before)
+                if position_change >= amount * 0.95:  # 95% tolerance
+                    logger.warning(
+                        f"⚠️ ORDER LIKELY EXECUTED despite error [{exchange}] {symbol} {side} "
+                        f"| position_before={contracts_before}, position_after={contracts_after} "
+                        f"| change={position_change}, requested={amount} | SKIPPING RETRY"
+                    )
+                    return OrderResult(
+                        status="filled",
+                        data={"detected_by": "position_check"},
+                        msg="order_executed_detected_by_position",
+                        filled=position_change,
+                        requested_amount=amount,
+                    )
+
                 delay = self._get_retry_delay(attempt)
                 logger.warning(
                     f"🔁 ORDER RETRY {attempt}/{self.retry_attempts} "
@@ -1018,9 +1044,19 @@ class TradeEngine:
                 "error": "missing_exchange_info",
             }
         
-        # ИСПРАВЛЕНО: определяем объёмы
-        # Приоритет: явный volume > long_amount/short_amount из position
-        if volume is not None and volume > 0:
+        # ИСПРАВЛЕНО v2: определяем объёмы с учётом actual volumes (для корректного закрытия при дисбалансе)
+        # Приоритет: actual_*_volume > явный volume > long_amount/short_amount из position
+        actual_long = position.get("actual_long_volume")
+        actual_short = position.get("actual_short_volume")
+
+        if actual_long is not None and actual_long > 0 and actual_short is not None and actual_short > 0:
+            # FIX Problem 5: Используем реальные объёмы вместо расчётных
+            long_amount = actual_long
+            short_amount = actual_short
+            logger.debug(
+                f"EXIT using ACTUAL volumes | LONG={long_amount}, SHORT={short_amount}"
+            )
+        elif volume is not None and volume > 0:
             long_amount = volume
             short_amount = volume
         else:

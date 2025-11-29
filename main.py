@@ -39,8 +39,51 @@ STATE_PAUSED = "PAUSED"
 STATE_ERROR = "ERROR"
 
 # Event-driven settings
-EVENT_DEBOUNCE_MS = 50  # Минимальный интервал между обработками одного символа
+EVENT_DEBOUNCE_MS = 15  # Минимальный интервал между обработками (снижен с 50ms для быстрой реакции)
 POSITION_CHECK_INTERVAL = 0.5  # Интервал проверки SL/TP для позиций в HOLD
+
+
+# ==============================
+# FIX Problem 7: Background DB helpers
+# ==============================
+
+async def _save_entry_background(
+    db: "DBManager",
+    pair_id: int,
+    long_exchange: str,
+    short_exchange: str,
+    filled_parts: int,
+    closed_parts: int,
+    entry_prices_long: list,
+    entry_prices_short: list,
+    part_volume: float,
+    symbol: str,
+    volume: float,
+    spread_pct: float,
+):
+    """
+    Асинхронное сохранение входа в DB в background.
+    Не блокирует критический торговый путь.
+    """
+    try:
+        await db.save_position(
+            pair_id=pair_id,
+            long_exchange=long_exchange,
+            short_exchange=short_exchange,
+            filled_parts=filled_parts,
+            closed_parts=closed_parts,
+            entry_prices_long=entry_prices_long,
+            entry_prices_short=entry_prices_short,
+            part_volume=part_volume,
+        )
+        await db.log_trade_event(
+            pair_id, "ENTRY_OK", "info",
+            f"Entry {symbol}: {long_exchange}->{short_exchange}, part 1",
+            {"buy_exchange": long_exchange, "sell_exchange": short_exchange,
+             "volume": volume, "spread_pct": spread_pct}
+        )
+    except Exception as e:
+        logger.error(f"[{pair_id}] Background DB save failed: {e}")
 
 
 # ==============================
@@ -70,10 +113,11 @@ class PairState:
     status: str = STATE_READY
     actual_long_volume: float = 0.0
     actual_short_volume: float = 0.0
-    
+
     # Event-driven: время последней обработки
     last_process_time: float = 0.0
-    processing: bool = False  # Lock для предотвращения параллельной обработки
+    # FIX: asyncio.Lock вместо bool для атомарной защиты от race condition
+    _lock: asyncio.Lock = field(default_factory=asyncio.Lock)
 
     def __post_init__(self):
         self.n_orders = max(1, int(self.n_orders))
@@ -221,6 +265,9 @@ async def _emergency_close_position(state: PairState, trader: TradeEngine, db: D
             "long_exchange": state.long_exchange,
             "short_exchange": state.short_exchange,
             "pair_id": state.pair_id,
+            # FIX Problem 5: передаём actual volumes для корректного закрытия при дисбалансе
+            "actual_long_volume": state.actual_long_volume,
+            "actual_short_volume": state.actual_short_volume,
         }
         res = await trader.execute_exit(position_info, state.open_volume)
         if res["success"]:
@@ -387,6 +434,9 @@ class TradingCore:
                 "long_exchange": state.long_exchange,
                 "short_exchange": state.short_exchange,
                 "pair_id": pair_id,
+                # FIX Problem 5: передаём actual volumes для корректного закрытия при дисбалансе
+                "actual_long_volume": state.actual_long_volume,
+                "actual_short_volume": state.actual_short_volume,
             }
 
             res = await self.trader.execute_exit(position_info, state.open_volume)
@@ -648,19 +698,19 @@ class TradingCore:
 
     async def _process_ready_state(self, state: PairState):
         """Process a READY state pair when market data updates."""
-        if state.processing:
-            return
-        state.processing = True
-        try:
-            await handle_state_ready(
-                self.db, self.market, self.trader,
-                None, state, self.risk_controller, self
-            )
-        except Exception as e:
-            logger.error(f"[{state.pair_id}] Error in ready state: {e}")
-        finally:
-            state.processing = False
-            state.last_process_time = time.time()
+        # FIX: Используем asyncio.Lock для атомарной проверки (предотвращает race condition)
+        if state._lock.locked():
+            return  # Уже обрабатывается другим callback'ом
+        async with state._lock:
+            try:
+                await handle_state_ready(
+                    self.db, self.market, self.trader,
+                    None, state, self.risk_controller, self
+                )
+            except Exception as e:
+                logger.error(f"[{state.pair_id}] Error in ready state: {e}")
+            finally:
+                state.last_process_time = time.time()
 
     async def _restore_positions(self):
         """Restore open positions from database on startup."""
@@ -871,33 +921,25 @@ class TradingCore:
         while not self.shutdown_mgr.is_shutdown_requested:
             try:
                 for state in list(self.pair_states.values()):
-                    if state.processing:
+                    # FIX: Используем Lock вместо bool
+                    if state._lock.locked():
                         continue
-                    
+
                     if state.status == STATE_ENTERING:
-                        state.processing = True
-                        try:
+                        async with state._lock:
                             await handle_state_entering(self.db, self.market, self.trader, None, state)
-                        finally:
-                            state.processing = False
-                    
+
                     elif state.status == STATE_HOLD:
-                        state.processing = True
-                        try:
+                        async with state._lock:
                             await handle_state_hold(self.db, self.market, self.trader, None, state)
-                        finally:
-                            state.processing = False
-                    
+
                     elif state.status == STATE_EXITING:
-                        state.processing = True
-                        try:
+                        async with state._lock:
                             await handle_state_exiting(self.db, self.market, self.trader, None, state)
-                        finally:
-                            state.processing = False
-                
+
             except Exception as e:
                 logger.error(f"Error in position monitor loop: {e}")
-            
+
             await asyncio.sleep(POSITION_CHECK_INTERVAL)
 
     async def _risk_refresh_loop(self):
@@ -962,7 +1004,7 @@ async def handle_state_ready(
         if core.circuit_breaker_is_open(buy_ex) or core.circuit_breaker_is_open(sell_ex):
             return  # Exchange disabled after consecutive errors
 
-    # Step 4: VWAP verification - check orderbook depth for actual volume
+    # Step 4: First VWAP check (preliminary)
     verified_signal = await market.check_spread(
         symbol=symbol,
         buy_exchange=buy_ex,
@@ -984,9 +1026,28 @@ async def handle_state_ready(
     if not allowed:
         return
 
-    logger.info(f"[{state.pair_id}] ENTRY {symbol} | {buy_ex}->{sell_ex} spread={real_spread}% (VWAP)")
+    # FIX: Step 6 - FINAL spread check immediately before execution (TOCTOU protection)
+    # Спред мог измениться за время risk check, проверяем ещё раз
+    final_signal = await market.check_spread(
+        symbol=symbol,
+        buy_exchange=buy_ex,
+        sell_exchange=sell_ex,
+        volume_in_coin=monitor_volume,
+    )
 
-    res = await trader.execute_entry(verified_signal, monitor_volume, pair_id=state.pair_id, leverage=state.leverage)
+    if not final_signal:
+        await risk_controller.release_entry_slot(planned_notional)
+        return
+
+    final_spread = final_signal["net_full_spread_pct"]
+    if final_spread < state.entry_spread:
+        await risk_controller.release_entry_slot(planned_notional)
+        logger.debug(f"[{state.pair_id}] ENTRY ABORTED: spread dropped {real_spread:.3f}% -> {final_spread:.3f}%")
+        return
+
+    logger.info(f"[{state.pair_id}] ENTRY {symbol} | {buy_ex}->{sell_ex} spread={final_spread}% (VWAP, verified)")
+
+    res = await trader.execute_entry(final_signal, monitor_volume, pair_id=state.pair_id, leverage=state.leverage)
 
     # Circuit breaker: record success/error
     if res["success"]:
@@ -1011,26 +1072,29 @@ async def handle_state_ready(
         imbalance_pct = (imbalance / monitor_volume * 100) if monitor_volume > 0 else 0
         if imbalance_pct > 5:
             logger.warning(f"[{state.pair_id}] VOLUME IMBALANCE: {imbalance_pct:.2f}%")
-            await db.log_trade_event(state.pair_id, "VOLUME_IMBALANCE", "warning", f"Volume imbalance: {imbalance_pct:.2f}%",
-                {"filled_long": filled_long, "filled_short": filled_short, "requested": monitor_volume})
+            # Background log for imbalance warning
+            asyncio.create_task(db.log_trade_event(state.pair_id, "VOLUME_IMBALANCE", "warning",
+                f"Volume imbalance: {imbalance_pct:.2f}%",
+                {"filled_long": filled_long, "filled_short": filled_short, "requested": monitor_volume}))
 
-        await db.save_position(
+        # FIX Problem 7: DB операции в background - не блокируем критический путь
+        # Сначала обновляем статус (мгновенно), потом сохраняем в DB асинхронно
+        state.status = STATE_ENTERING if state.n_orders > 1 else STATE_HOLD
+
+        asyncio.create_task(_save_entry_background(
+            db=db,
             pair_id=state.pair_id,
             long_exchange=state.long_exchange,
             short_exchange=state.short_exchange,
             filled_parts=state.filled_parts,
             closed_parts=state.closed_parts,
-            entry_prices_long=state.entry_prices_long,
-            entry_prices_short=state.entry_prices_short,
+            entry_prices_long=state.entry_prices_long.copy(),  # copy to avoid race
+            entry_prices_short=state.entry_prices_short.copy(),
             part_volume=state.part_volume,
-        )
-
-        await db.log_trade_event(state.pair_id, "ENTRY_OK", "info",
-            f"Entry {symbol}: {state.long_exchange}->{state.short_exchange}, part 1/{state.n_orders}",
-            {"buy_exchange": state.long_exchange, "sell_exchange": state.short_exchange,
-             "volume": monitor_volume, "spread_pct": real_spread})
-
-        state.status = STATE_ENTERING if state.n_orders > 1 else STATE_HOLD
+            symbol=symbol,
+            volume=monitor_volume,
+            spread_pct=real_spread,
+        ))
     else:
         # Circuit breaker: record error
         if core:
@@ -1048,12 +1112,15 @@ async def handle_state_ready(
         await risk_controller.release_entry_slot(planned_notional)
         error_code = res.get("error") or "ENTRY_ERROR"
         if error_code == "second_leg_failed_emergency_close":
-            await db.update_pair_status(state.pair_id, "paused")
-            await db.log_trade_event(state.pair_id, "SECOND_LEG_FAILED", "error",
-                "Second leg failed, LONG closed emergency. Pair paused.", {"symbol": symbol})
             state.status = STATE_PAUSED
+            # FIX Problem 7: DB в background
+            asyncio.create_task(db.update_pair_status(state.pair_id, "paused"))
+            asyncio.create_task(db.log_trade_event(state.pair_id, "SECOND_LEG_FAILED", "error",
+                "Second leg failed, LONG closed emergency. Pair paused.", {"symbol": symbol}))
         else:
-            await db.log_trade_event(state.pair_id, "ENTRY_ERROR", "error", f"Entry error: {error_code}", {"symbol": symbol})
+            # FIX Problem 7: DB в background
+            asyncio.create_task(db.log_trade_event(state.pair_id, "ENTRY_ERROR", "error",
+                f"Entry error: {error_code}", {"symbol": symbol}))
 
 
 async def handle_state_entering(
@@ -1188,7 +1255,15 @@ async def handle_state_hold(
 
     if is_sl:
         logger.warning(f"[{state.pair_id}] SL TRIGGERED {symbol} | PnL={total_pnl:.2f}$ <= -{state.stop_loss}$")
-        position_info = {"symbol": symbol, "long_exchange": state.long_exchange, "short_exchange": state.short_exchange, "pair_id": state.pair_id}
+        # FIX Problem 5: передаём actual volumes для корректного закрытия при дисбалансе
+        position_info = {
+            "symbol": symbol,
+            "long_exchange": state.long_exchange,
+            "short_exchange": state.short_exchange,
+            "pair_id": state.pair_id,
+            "actual_long_volume": state.actual_long_volume,
+            "actual_short_volume": state.actual_short_volume,
+        }
         res = await trader.execute_exit(position_info, open_volume)
 
         if res["success"]:
@@ -1243,11 +1318,32 @@ async def handle_state_exiting(
     if net_spread > state.exit_spread:
         return
 
-    position_info = {"symbol": symbol, "long_exchange": state.long_exchange, "short_exchange": state.short_exchange, "pair_id": state.pair_id}
+    # FIX Problem 5: передаём actual volumes для корректного закрытия при дисбалансе
+    # При частичном выходе пропорционально уменьшаем actual volumes
+    parts_remaining = state.open_parts
+    if parts_remaining > 0 and state.actual_long_volume > 0 and state.actual_short_volume > 0:
+        # Закрываем пропорциональную часть от actual volumes
+        actual_long_part = state.actual_long_volume / parts_remaining
+        actual_short_part = state.actual_short_volume / parts_remaining
+    else:
+        actual_long_part = volume_to_close
+        actual_short_part = volume_to_close
+
+    position_info = {
+        "symbol": symbol,
+        "long_exchange": state.long_exchange,
+        "short_exchange": state.short_exchange,
+        "pair_id": state.pair_id,
+        "actual_long_volume": actual_long_part,
+        "actual_short_volume": actual_short_part,
+    }
     res = await trader.execute_exit(position_info, volume_to_close)
 
     if res["success"]:
         state.closed_parts += 1
+        # FIX Problem 5: уменьшаем actual volumes после частичного закрытия
+        state.actual_long_volume = max(0.0, state.actual_long_volume - actual_long_part)
+        state.actual_short_volume = max(0.0, state.actual_short_volume - actual_short_part)
 
         pos_prices = await market.get_position_prices(
             symbol=symbol,

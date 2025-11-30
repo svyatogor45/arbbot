@@ -1699,13 +1699,14 @@ async def handle_state_hold(
         res = await trader.execute_exit(position_info, open_volume)
 
         if res["success"]:
-            await db.update_pair_pnl(state.pair_id, total_pnl)
-            await db.increment_sl(state.pair_id)
-            await db.update_pair_status(state.pair_id, "paused")
-            await db.log_trade_event(state.pair_id, "SL_TRIGGERED", "error",
+            # FIX 1.3: DB операции в background - не блокируем после SL
+            asyncio.create_task(db.update_pair_pnl(state.pair_id, total_pnl))
+            asyncio.create_task(db.increment_sl(state.pair_id))
+            asyncio.create_task(db.update_pair_status(state.pair_id, "paused"))
+            asyncio.create_task(db.log_trade_event(state.pair_id, "SL_TRIGGERED", "error",
                 f"SL on {symbol}: PnL={total_pnl:.2f}$, pair paused",
-                {"pnl": total_pnl, "stop_loss": state.stop_loss})
-            await db.delete_position(state.pair_id)
+                {"pnl": total_pnl, "stop_loss": state.stop_loss}))
+            asyncio.create_task(db.delete_position(state.pair_id))
             state.reset_after_exit()
             state.status = STATE_PAUSED
         else:

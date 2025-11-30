@@ -56,7 +56,7 @@ PARTIAL_FILL_WARNING_RATIO = 0.99  # 99%
 MAX_EMERGENCY_ATTEMPTS = 3
 
 # Таймаут на весь emergency close цикл (секунды)
-EMERGENCY_CLOSE_TIMEOUT = 60.0
+EMERGENCY_CLOSE_TIMEOUT = 20.0  # FIX 3.3: было 60, ускорено для быстрой эскалации
 
 # Задержка между emergency попытками (секунды)
 EMERGENCY_RETRY_DELAY = 2.0

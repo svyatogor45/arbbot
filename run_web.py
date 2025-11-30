@@ -29,6 +29,8 @@ from loguru import logger
 sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
 
 from db_manager import DBManager
+from exchange_manager import ExchangeManager
+import api_server
 from api_server import app, ws_manager
 
 # Import main.py's TradingCore
@@ -228,7 +230,6 @@ async def run_trading_core_supervised():
             await _trading_core.init()
 
             # Link to API server
-            import api_server
             api_server.trading_core = _trading_core
 
             _supervisor_metrics.record_start()
@@ -374,6 +375,15 @@ async def lifespan(app):
     db = DBManager()
     await db.init_db()
     logger.info("✅ Database initialized")
+
+    # Initialize exchange manager
+    ex_manager = ExchangeManager()
+    await ex_manager.initialize()
+    logger.info("✅ Exchange manager initialized")
+
+    # Link to api_server globals (fix for API endpoints)
+    api_server.db = db
+    api_server.ex_manager = ex_manager
 
     # Startup checks (positions, emergency positions)
     positions_count, emergency_count = await startup_checks(db)

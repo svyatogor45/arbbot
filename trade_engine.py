@@ -206,25 +206,36 @@ class TradeEngine:
         self,
         exchange: str,
         side: str,
-        is_close: bool = False
+        is_close: bool = False,
+        position_side: str = None,  # "long" or "short" for hedge mode
     ) -> dict:
         """
         Формирует правильные params для ордера в зависимости от биржи.
 
-        Для One-way mode (рекомендуется для арбитража):
+        Для One-way mode:
         - reduceOnly для закрытия позиций
 
-        Для Hedge mode (если биржа настроена так):
-        - positionSide: LONG для buy/sell long
-        - positionSide: SHORT для buy/sell short
+        Для Hedge mode:
+        - positionSide: LONG/SHORT обязательно
+        - reduceOnly для закрытия
         """
         params = {}
         ex = exchange.lower()
 
+        # Hedge mode: добавляем positionSide для каждой биржи
+        if position_side:
+            ps = position_side.upper()
+            if ex in ("bingx", "binance"):
+                params["positionSide"] = ps
+            elif ex == "bitget":
+                params["holdSide"] = ps.lower()  # bitget: long/short lowercase
+            elif ex == "okx":
+                params["posSide"] = ps.lower()  # okx: long/short lowercase
+            elif ex == "bybit":
+                params["positionIdx"] = 1 if ps == "LONG" else 2  # bybit: 1=long, 2=short
+
         if is_close:
-            # Закрытие позиции
             params["reduceOnly"] = True
-        # Для открытия позиции не передаём reduceOnly (по умолчанию False)
 
         return params
 
@@ -547,6 +558,7 @@ class TradeEngine:
         amount: float,
         leg_label: str,
         pair_id: Optional[int] = None,
+        position_side: str = None,  # "long" or "short" for hedge mode
     ) -> dict:
         """
         Экстренное закрытие ноги с ретраями, таймаутом и эскалацией.
@@ -605,7 +617,7 @@ class TradeEngine:
                 side=side,
                 amount=remaining_amount,
                 leg_label=f"{leg_label}_attempt{attempt}",
-                params=self._build_order_params(exchange, side, is_close=True),
+                params=self._build_order_params(exchange, side, is_close=True, position_side=position_side),
             )
             last_order = close_order
 
@@ -912,7 +924,7 @@ class TradeEngine:
             "buy",
             volume,
             leg_label="entry_long",
-            params=self._build_order_params(long_ex, "buy", is_close=False),
+            params=self._build_order_params(long_ex, "buy", is_close=False, position_side="long"),
         )
 
         short_task = self._order_with_retries(
@@ -921,7 +933,7 @@ class TradeEngine:
             "sell",
             volume,
             leg_label="entry_short",
-            params=self._build_order_params(short_ex, "sell", is_close=False),
+            params=self._build_order_params(short_ex, "sell", is_close=False, position_side="short"),
         )
 
         long_order, short_order = await asyncio.gather(long_task, short_task)
@@ -964,6 +976,7 @@ class TradeEngine:
                     amount=short_filled,
                     leg_label="emergency_close_short",
                     pair_id=pair_id,
+                    position_side="short",
                 )
 
                 if close_result["critical"]:
@@ -996,6 +1009,7 @@ class TradeEngine:
                     amount=long_filled,
                     leg_label="emergency_close_long",
                     pair_id=pair_id,
+                    position_side="long",
                 )
 
                 if close_result["critical"]:
@@ -1024,7 +1038,7 @@ class TradeEngine:
             long_order = await self._fill_remaining(
                 long_ex, symbol, "buy", volume, long_filled,
                 leg_label="entry_long",
-                params=self._build_order_params(long_ex, "buy", is_close=False),
+                params=self._build_order_params(long_ex, "buy", is_close=False, position_side="long"),
             )
             long_filled = long_order.get("filled") or long_filled
 
@@ -1037,7 +1051,7 @@ class TradeEngine:
             short_order = await self._fill_remaining(
                 short_ex, symbol, "sell", volume, short_filled,
                 leg_label="entry_short",
-                params=self._build_order_params(short_ex, "sell", is_close=False),
+                params=self._build_order_params(short_ex, "sell", is_close=False, position_side="short"),
             )
             short_filled = short_order.get("filled") or short_filled
 
@@ -1085,6 +1099,7 @@ class TradeEngine:
                 amount=excess_amount,
                 leg_label=f"close_excess_{excess_leg.lower()}",
                 pair_id=pair_id,
+                position_side=excess_leg.lower(),  # "long" or "short"
             )
 
             if close_result["critical"]:
@@ -1218,13 +1233,15 @@ class TradeEngine:
         )
 
         # Закрываем обе ноги параллельно
+        # Закрыть LONG = sell с position_side="long"
+        # Закрыть SHORT = buy с position_side="short"
         long_task = self._order_with_retries(
             long_ex,
             symbol,
             "sell",
             long_amount,
             leg_label="exit_long",
-            params=self._build_order_params(long_ex, "sell", is_close=True),
+            params=self._build_order_params(long_ex, "sell", is_close=True, position_side="long"),
         )
 
         short_task = self._order_with_retries(
@@ -1233,7 +1250,7 @@ class TradeEngine:
             "buy",
             short_amount,
             leg_label="exit_short",
-            params=self._build_order_params(short_ex, "buy", is_close=True),
+            params=self._build_order_params(short_ex, "buy", is_close=True, position_side="short"),
         )
 
         long_order, short_order = await asyncio.gather(long_task, short_task)
@@ -1292,6 +1309,7 @@ class TradeEngine:
                     amount=residual_amount,
                     leg_label=f"exit_residual_{residual_leg.lower()}",
                     pair_id=pair_id,
+                    position_side=residual_leg.lower(),  # "long" or "short"
                 )
 
                 if close_result["critical"]:

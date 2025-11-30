@@ -206,25 +206,66 @@ class TradeEngine:
         self,
         exchange: str,
         side: str,
-        is_close: bool = False
+        is_close: bool = False,
+        position_side: str = None,  # "long" or "short" for hedge mode
     ) -> dict:
         """
         Формирует правильные params для ордера в зависимости от биржи.
 
-        Для One-way mode (рекомендуется для арбитража):
-        - reduceOnly для закрытия позиций
+        ВАЖНО: Биржи должны быть настроены в Hedge mode для корректной работы!
 
-        Для Hedge mode (если биржа настроена так):
-        - positionSide: LONG для buy/sell long
-        - positionSide: SHORT для buy/sell short
+        Параметры для разных бирж:
+        - BingX/Binance: positionSide (LONG/SHORT)
+        - Bitget: holdSide (long/short)
+        - OKX: posSide (long/short)
+        - Bybit: positionIdx (1=long, 2=short)
+        - HTX: direction (buy/sell для открытия, sell/buy для закрытия)
+        - Gate: auto_size для закрытия
+        - MEXC: positionSide (LONG/SHORT)
         """
         params = {}
         ex = exchange.lower()
 
+        # Hedge mode: добавляем positionSide для каждой биржи
+        if position_side:
+            ps = position_side.upper()
+            ps_lower = position_side.lower()
+
+            if ex in ("bingx", "binance", "mexc"):
+                params["positionSide"] = ps  # LONG/SHORT
+            elif ex == "bitget":
+                params["holdSide"] = ps_lower  # long/short
+            elif ex == "okx":
+                params["posSide"] = ps_lower  # long/short (net for one-way)
+            elif ex == "bybit":
+                # Bybit Hedge mode: positionIdx 1=Buy side(LONG), 2=Sell side(SHORT)
+                params["positionIdx"] = 1 if ps == "LONG" else 2
+            elif ex == "htx":
+                # HTX uses direction parameter
+                params["direction"] = ps_lower  # long/short
+            elif ex == "gate":
+                # Gate uses auto_size for closing in hedge mode
+                if is_close:
+                    params["auto_size"] = ps_lower  # close_long/close_short
+
+        # reduceOnly для закрытия позиций
         if is_close:
-            # Закрытие позиции
-            params["reduceOnly"] = True
-        # Для открытия позиции не передаём reduceOnly (по умолчанию False)
+            # Некоторые биржи используют разные параметры для reduceOnly
+            if ex == "okx":
+                params["reduceOnly"] = True
+            elif ex == "bitget":
+                params["reduceOnly"] = True
+            elif ex == "bybit":
+                params["reduceOnly"] = True
+            elif ex in ("bingx", "binance", "mexc"):
+                params["reduceOnly"] = True
+            elif ex == "htx":
+                # HTX может использовать offset вместо reduceOnly
+                params["offset"] = "close"
+            elif ex == "gate":
+                params["reduce_only"] = True  # Gate uses underscore
+            else:
+                params["reduceOnly"] = True  # default
 
         return params
 
@@ -273,9 +314,19 @@ class TradeEngine:
             )
 
         # FIX #4: Генерируем clientOrderId если не передан
+        # Разные биржи используют разные имена параметров
         order_params = dict(params) if params else {}
         coid = client_order_id or self._generate_client_order_id(exchange, side)
-        order_params["clientOrderId"] = coid
+        ex = exchange.lower()
+
+        # Биржеспецифичные имена для clientOrderId
+        if ex == "okx":
+            order_params["clOrdId"] = coid  # OKX uses clOrdId
+        elif ex == "gate":
+            order_params["text"] = coid  # Gate uses text
+        elif ex in ("bybit", "bitget", "bingx", "binance", "mexc", "htx"):
+            order_params["clientOrderId"] = coid
+        # Для остальных бирж не добавляем (может вызвать ошибку)
 
         try:
             raw = await self.manager.place_order(
@@ -547,6 +598,7 @@ class TradeEngine:
         amount: float,
         leg_label: str,
         pair_id: Optional[int] = None,
+        position_side: str = None,  # "long" or "short" for hedge mode
     ) -> dict:
         """
         Экстренное закрытие ноги с ретраями, таймаутом и эскалацией.
@@ -605,7 +657,7 @@ class TradeEngine:
                 side=side,
                 amount=remaining_amount,
                 leg_label=f"{leg_label}_attempt{attempt}",
-                params=self._build_order_params(exchange, side, is_close=True),
+                params=self._build_order_params(exchange, side, is_close=True, position_side=position_side),
             )
             last_order = close_order
 
@@ -912,7 +964,7 @@ class TradeEngine:
             "buy",
             volume,
             leg_label="entry_long",
-            params=self._build_order_params(long_ex, "buy", is_close=False),
+            params=self._build_order_params(long_ex, "buy", is_close=False, position_side="long"),
         )
 
         short_task = self._order_with_retries(
@@ -921,7 +973,7 @@ class TradeEngine:
             "sell",
             volume,
             leg_label="entry_short",
-            params=self._build_order_params(short_ex, "sell", is_close=False),
+            params=self._build_order_params(short_ex, "sell", is_close=False, position_side="short"),
         )
 
         long_order, short_order = await asyncio.gather(long_task, short_task)
@@ -964,6 +1016,7 @@ class TradeEngine:
                     amount=short_filled,
                     leg_label="emergency_close_short",
                     pair_id=pair_id,
+                    position_side="short",
                 )
 
                 if close_result["critical"]:
@@ -996,6 +1049,7 @@ class TradeEngine:
                     amount=long_filled,
                     leg_label="emergency_close_long",
                     pair_id=pair_id,
+                    position_side="long",
                 )
 
                 if close_result["critical"]:
@@ -1024,7 +1078,7 @@ class TradeEngine:
             long_order = await self._fill_remaining(
                 long_ex, symbol, "buy", volume, long_filled,
                 leg_label="entry_long",
-                params=self._build_order_params(long_ex, "buy", is_close=False),
+                params=self._build_order_params(long_ex, "buy", is_close=False, position_side="long"),
             )
             long_filled = long_order.get("filled") or long_filled
 
@@ -1037,7 +1091,7 @@ class TradeEngine:
             short_order = await self._fill_remaining(
                 short_ex, symbol, "sell", volume, short_filled,
                 leg_label="entry_short",
-                params=self._build_order_params(short_ex, "sell", is_close=False),
+                params=self._build_order_params(short_ex, "sell", is_close=False, position_side="short"),
             )
             short_filled = short_order.get("filled") or short_filled
 
@@ -1085,6 +1139,7 @@ class TradeEngine:
                 amount=excess_amount,
                 leg_label=f"close_excess_{excess_leg.lower()}",
                 pair_id=pair_id,
+                position_side=excess_leg.lower(),  # "long" or "short"
             )
 
             if close_result["critical"]:
@@ -1218,13 +1273,15 @@ class TradeEngine:
         )
 
         # Закрываем обе ноги параллельно
+        # Закрыть LONG = sell с position_side="long"
+        # Закрыть SHORT = buy с position_side="short"
         long_task = self._order_with_retries(
             long_ex,
             symbol,
             "sell",
             long_amount,
             leg_label="exit_long",
-            params=self._build_order_params(long_ex, "sell", is_close=True),
+            params=self._build_order_params(long_ex, "sell", is_close=True, position_side="long"),
         )
 
         short_task = self._order_with_retries(
@@ -1233,7 +1290,7 @@ class TradeEngine:
             "buy",
             short_amount,
             leg_label="exit_short",
-            params=self._build_order_params(short_ex, "buy", is_close=True),
+            params=self._build_order_params(short_ex, "buy", is_close=True, position_side="short"),
         )
 
         long_order, short_order = await asyncio.gather(long_task, short_task)
@@ -1292,6 +1349,7 @@ class TradeEngine:
                     amount=residual_amount,
                     leg_label=f"exit_residual_{residual_leg.lower()}",
                     pair_id=pair_id,
+                    position_side=residual_leg.lower(),  # "long" or "short"
                 )
 
                 if close_result["critical"]:

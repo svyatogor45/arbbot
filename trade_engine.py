@@ -250,8 +250,14 @@ class TradeEngine:
                 params["direction"] = ps_lower  # long/short
             elif ex == "gate":
                 # Gate uses auto_size for closing in hedge mode
+                # Format: "close_long" or "close_short" (not just "long"/"short")
                 if is_close:
-                    params["auto_size"] = ps_lower  # close_long/close_short
+                    params["auto_size"] = f"close_{ps_lower}"  # close_long/close_short
+
+        # OKX: tdMode is required for all orders (derivatives)
+        # Must be added regardless of hedge/one-way mode
+        if ex == "okx":
+            params["tdMode"] = "cross"  # cross margin mode
 
         # reduceOnly для закрытия позиций
         if is_close:
@@ -265,7 +271,10 @@ class TradeEngine:
                 if not is_hedge_mode:
                     params["reduceOnly"] = True
             elif ex == "okx":
-                params["reduceOnly"] = True
+                # OKX: In Hedge mode, posSide is sufficient for closing (reduceOnly conflicts)
+                # In One-way mode, reduceOnly is required
+                if not is_hedge_mode:
+                    params["reduceOnly"] = True
             elif ex == "bitget":
                 # Bitget: в One-way mode нужен reduceOnly
                 if not is_hedge_mode:
@@ -286,16 +295,19 @@ class TradeEngine:
         """
         Генерирует уникальный clientOrderId для дедупликации ордеров.
 
-        Формат: ARB_{exchange}_{side}_{timestamp_ms}_{uuid4_short}
-        Пример: ARB_bybi_b_170123456_a1b2c3d4 (max 32 chars for OKX)
-
-        Большинство бирж поддерживают clientOrderId до 32-36 символов.
-        OKX требует max 32 символа.
+        Формат зависит от биржи:
+        - OKX: только буквы и цифры (без underscore!), max 32 символа
+        - Остальные: ARB_{exchange}_{side}_{timestamp}_{uuid}
         """
         ts = str(int(time.time() * 1000))[-9:]  # last 9 digits
         short_uuid = uuid.uuid4().hex[:6]
-        ex_short = exchange[:4]
+        ex_short = exchange[:4].lower()
         side_short = side[0]  # 'b' or 's'
+
+        # OKX не принимает underscore в clOrdId - используем только буквы и цифры
+        if exchange.lower() == "okx":
+            return f"arb{ex_short}{side_short}{ts}{short_uuid}"  # без underscore
+
         return f"ARB_{ex_short}_{side_short}_{ts}_{short_uuid}"
 
     async def _order(

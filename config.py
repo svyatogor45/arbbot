@@ -115,7 +115,7 @@ DEFAULT_LEVERAGE = 10
 # Для арбитража рекомендуется Hedge mode на всех биржах.
 
 POSITION_MODES = {
-    "bitget": "one_way",   # Если у вас One-way mode на Bitget
+    "bitget": "hedge",     # Hedge mode на Bitget (LONG+SHORT одновременно)
     "bingx": "hedge",      # BingX в Hedge mode
     "binance": "hedge",
     "bybit": "hedge",

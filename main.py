@@ -173,7 +173,8 @@ class PairState:
 # ==============================
 
 # FIX Problem 3: TTL для кэша настроек (секунды)
-SETTINGS_CACHE_TTL = 10.0
+# Оптимизировано: 10s → 60s (настройки меняются редко, сброс кэша при изменении через веб)
+SETTINGS_CACHE_TTL = 60.0
 
 
 class RiskController:
@@ -262,6 +263,10 @@ class RiskController:
             "current_risk_usdt": self._current_risk_usdt,
             "max_risk_usdt": MAX_TOTAL_RISK_USDT,
         }
+
+    def invalidate_cache(self):
+        """Сброс кэша настроек — вызывается при изменении через веб-интерфейс."""
+        self._cache_updated_at = 0.0
 
 
 def estimate_planned_position_notional(state: PairState, signal: dict) -> float:
@@ -678,6 +683,10 @@ class TradingCore:
 
             except (ValueError, TypeError) as e:
                 errors.append(f"{key}: invalid value ({e})")
+
+        # Сброс кэша настроек — новые значения применятся мгновенно
+        if updated:
+            self.risk_controller.invalidate_cache()
 
         return {"success": len(errors) == 0, "updated": updated, "errors": errors}
 

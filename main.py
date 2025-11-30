@@ -39,7 +39,7 @@ STATE_PAUSED = "PAUSED"
 STATE_ERROR = "ERROR"
 
 # Event-driven settings
-EVENT_DEBOUNCE_MS = 15  # Минимальный интервал между обработками (снижен с 50ms для быстрой реакции)
+EVENT_DEBOUNCE_MS = 5  # ОПТИМИЗАЦИЯ: 5ms для быстрой реакции (было 15ms) ⚡
 POSITION_CHECK_INTERVAL = 0.5  # Интервал проверки SL/TP для позиций в HOLD
 POSITION_VALIDATION_INTERVAL = 30.0  # FIX Problem 1: Интервал сверки позиций с биржами (сек)
 
@@ -173,7 +173,7 @@ class PairState:
 # ==============================
 
 # FIX Problem 3: TTL для кэша настроек (секунды)
-SETTINGS_CACHE_TTL = 10.0
+SETTINGS_CACHE_TTL = 60.0  # ОПТИМИЗАЦИЯ: 60 сек (было 10.0) - настройки меняются редко ⚡
 
 
 class RiskController:

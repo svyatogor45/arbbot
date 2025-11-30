@@ -33,7 +33,7 @@ def safe_levels_mexc(levels):
     return result
 
 WS_STALE_TIMEOUT = WS_PING_INTERVAL * 3
-DEBUG_WS_RAW = False
+DEBUG_WS_RAW = True  # TEMP: debug bybit
 RECONNECT_DELAY_BASE = 1.0   # FIX 2.3: быстрее переподключение (было 3.0)
 RECONNECT_DELAY_MAX = 10.0   # FIX 2.3: макс 10 сек (было 30.0)
 RECONNECT_BACKOFF_MULTIPLIER = 1.5
@@ -476,11 +476,23 @@ class WsManager:
                 timestamp=ts
             )
         # BYBIT
-        if ex == "bybit" and "topic" in data and "orderbook" in data["topic"]:
-            ob = data.get("data", [{}])
-            if isinstance(ob, list) and ob: ob = ob[0]
-            if isinstance(ob, dict):
-                return to_internal(data["topic"].split(".")[-1]), snap(safe_levels(ob.get("b", [])), safe_levels(ob.get("a", [])))
+        if ex == "bybit":
+            # Debug: log all bybit messages
+            if DEBUG_WS_RAW:
+                logger.debug(f"[BYBIT RAW] {str(data)[:500]}")
+            if "topic" in data and "orderbook" in data["topic"]:
+                ob = data.get("data", {})
+                # v5 API returns data as dict, not list
+                if isinstance(ob, list) and ob:
+                    ob = ob[0]
+                if isinstance(ob, dict):
+                    symbol = data["topic"].split(".")[-1]
+                    bids = safe_levels(ob.get("b", []))
+                    asks = safe_levels(ob.get("a", []))
+                    if bids or asks:
+                        return to_internal(symbol), snap(bids, asks)
+                    else:
+                        logger.warning(f"[BYBIT] Empty orderbook for {symbol}: b={len(ob.get('b', []))}, a={len(ob.get('a', []))}")
         # BITGET
         if ex == "bitget":
             arg = data.get("arg", {})

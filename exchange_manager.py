@@ -27,13 +27,16 @@ from symbol_mapper import to_ccxt_symbol, pretty
 # ============================================================
 
 # Время жизни кэша market info (секунды)
-MARKET_INFO_CACHE_TTL = 3600  # 1 час (ОПТИМИЗАЦИЯ: было 300, увеличено согласно отчету)
+# Оптимизировано: 300s → 3600s (лимиты бирж меняются очень редко)
+MARKET_INFO_CACHE_TTL = 3600  # 1 час
 
 # Время жизни кэша позиций (секунды)
-POSITION_CACHE_TTL = 2.0  # 2 секунды (ОПТИМИЗАЦИЯ: для арбитража - критически важно)
+# Короткий TTL — позиции могут меняться, но повторные проверки за 2 сек используют кэш
+POSITION_CACHE_TTL = 2.0
 
-# Время жизни кэша балансов (секунды)
-BALANCE_CACHE_TTL = 10.0  # 10 секунд (ОПТИМИЗАЦИЯ: баланс не меняется между проверкой и ордером)
+# Время жизни кэша баланса (секунды)
+# Баланс меняется только при открытии/закрытии позиций
+BALANCE_CACHE_TTL = 5.0
 
 # Интервал health check (секунды)
 HEALTH_CHECK_INTERVAL = 60
@@ -138,11 +141,11 @@ class ExchangeManager:
         # Кэш market info: { "bybit:BTC/USDT:USDT": CachedMarketInfo, ... }
         self._market_info_cache: Dict[str, CachedMarketInfo] = {}
 
-        # ОПТИМИЗАЦИЯ: Кэш позиций - { (exchange, symbol): (position, timestamp) }
-        self._position_cache: Dict[Tuple[str, str], Tuple[Optional[Dict], float]] = {}
+        # Кэш позиций: { "bybit:BTC/USDT": (position_data, timestamp), ... }
+        self._position_cache: Dict[str, Tuple[Optional[Dict], float]] = {}
 
-        # ОПТИМИЗАЦИЯ: Кэш балансов - { (exchange, currency): (balance, timestamp) }
-        self._balance_cache: Dict[Tuple[str, str], Tuple[float, float]] = {}
+        # Кэш балансов: { "bybit:USDT": (balance, timestamp), ... }
+        self._balance_cache: Dict[str, Tuple[Optional[float], float]] = {}
 
         # Метрики здоровья по биржам
         self._health: Dict[str, ExchangeHealth] = {}
@@ -689,40 +692,28 @@ class ExchangeManager:
             return None
 
     async def get_free_balance(self, exchange_name: str, currency: str) -> Optional[float]:
-        """
-        Получить свободный баланс по валюте.
-
-        ОПТИМИЗАЦИЯ: Кэширование с TTL 10 секунд
-        - Первый вызов: 50-200ms (HTTP запрос + сохранение в кэш)
-        - Повторный вызов (в течение 10 сек): ~0.01ms (из кэша) ⚡
-        """
+        """Получить свободный баланс по валюте с кэшированием."""
         name = self._normalize_name(exchange_name)
+        cache_key = f"{name}:{currency}"
 
-        # ОПТИМИЗАЦИЯ: Проверяем кэш балансов
-        cache_key = (name, currency)
+        # Проверяем кэш
         cached = self._balance_cache.get(cache_key)
-
-        if cached is not None:
-            balance, timestamp = cached
-            age = time.time() - timestamp
-            if age < BALANCE_CACHE_TTL:
-                # Кэш свежий - возвращаем без запроса на биржу
+        if cached:
+            balance, ts = cached
+            if time.time() - ts < BALANCE_CACHE_TTL:
                 return balance
 
-        # Кэш устарел или отсутствует - запрашиваем с биржи
         bal = await self.fetch_balance(exchange_name)
         if not bal:
             return None
 
         try:
             free = bal.get("free") or {}
-            result_balance = float(free.get(currency, 0.0))
+            result = float(free.get(currency, 0.0))
 
-            # ОПТИМИЗАЦИЯ: Сохраняем в кэш
-            self._balance_cache[cache_key] = (result_balance, time.time())
-
-            return result_balance
-
+            # Сохраняем в кэш
+            self._balance_cache[cache_key] = (result, time.time())
+            return result
         except Exception as e:
             logger.error(f"❌ get_free_balance({exchange_name}, {currency}): {e}")
             return None
@@ -742,7 +733,7 @@ class ExchangeManager:
 
     async def get_position(self, exchange_name: str, symbol: str) -> Optional[Dict[str, Any]]:
         """
-        Get position info for a symbol.
+        Get position info for a symbol with caching.
         Returns dict with keys: contracts, side, entryPrice, etc.
         Returns None if no position or error.
 
@@ -751,43 +742,38 @@ class ExchangeManager:
         - Повторный вызов (в течение 2 сек): ~0.01ms (из кэша) ⚡
         """
         name = self._normalize_name(exchange_name)
+        ccxt_symbol = to_ccxt_symbol(exchange_name, symbol)
+        cache_key = f"{name}:{ccxt_symbol}"
 
-        # ОПТИМИЗАЦИЯ: Проверяем кэш позиций
-        cache_key = (name, symbol)
+        # Проверяем кэш
         cached = self._position_cache.get(cache_key)
-
-        if cached is not None:
-            position, timestamp = cached
-            age = time.time() - timestamp
-            if age < POSITION_CACHE_TTL:
-                # Кэш свежий - возвращаем без запроса на биржу
+        if cached:
+            position, ts = cached
+            if time.time() - ts < POSITION_CACHE_TTL:
                 return position
 
-        # Кэш устарел или отсутствует - запрашиваем с биржи
         exchange = await self.load_exchange(exchange_name)
         if not exchange:
             return None
 
         health = self._get_health(name)
-        ccxt_symbol = to_ccxt_symbol(exchange_name, symbol)
 
         try:
             positions = await exchange.fetch_positions([ccxt_symbol])
             health.record_request(True)
 
-            result_position = None
+            result = None
             if positions:
                 for pos in positions:
                     if pos.get("symbol") == ccxt_symbol:
                         contracts = pos.get("contracts") or pos.get("contractSize") or 0
                         if contracts and float(contracts) != 0:
-                            result_position = pos
+                            result = pos
                             break
 
-            # ОПТИМИЗАЦИЯ: Сохраняем в кэш (даже если None - избегаем повторных запросов)
-            self._position_cache[cache_key] = (result_position, time.time())
-
-            return result_position
+            # Сохраняем в кэш (даже None — чтобы не дёргать биржу повторно)
+            self._position_cache[cache_key] = (result, time.time())
+            return result
 
         except Exception as e:
             code = self._classify_exception(e)

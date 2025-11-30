@@ -18,7 +18,7 @@ from config import DB_NAME, logger
 # ============================================================
 
 MAX_BUSY_RETRIES = 5
-BUSY_RETRY_DELAY = 0.05
+BUSY_RETRY_DELAY = 0.02  # FIX 4.2: было 0.05, ускорено
 CONNECTION_TIMEOUT = 10.0
 
 

@@ -376,10 +376,8 @@ async def lifespan(app):
     await db.init_db()
     logger.info("✅ Database initialized")
 
-    # Initialize exchange manager
+    # Initialize exchange manager (lazy - connects on first use)
     ex_manager = ExchangeManager()
-    await ex_manager.initialize()
-    logger.info("✅ Exchange manager initialized")
 
     # Link to api_server globals (fix for API endpoints)
     api_server.db = db

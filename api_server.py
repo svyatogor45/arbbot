@@ -131,8 +131,7 @@ async def lifespan(app: FastAPI):
     logger.info("API Server starting...")
     # Ensure managers are initialized
     _ensure_managers()
-    # Initialize exchange manager
-    await ex_manager.initialize()
+    # ExchangeManager connects lazily on first use
     yield
     logger.info("API Server shutting down...")
     if ex_manager:

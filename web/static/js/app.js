@@ -619,9 +619,9 @@
         document.getElementById('modal-exchange-title').textContent = `Connect ${ex.display_name}`;
         document.getElementById('exchange-name').value = name;
 
-        // Show passphrase field for OKX
+        // Show passphrase field for OKX and Bitget
         const passphraseGroup = document.getElementById('exchange-passphrase-group');
-        passphraseGroup.style.display = name === 'okx' ? 'block' : 'none';
+        passphraseGroup.style.display = (name === 'okx' || name === 'bitget') ? 'block' : 'none';
 
         elements.formExchange.reset();
         openModal(elements.modalExchange);

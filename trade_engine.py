@@ -999,13 +999,19 @@ class TradeEngine:
         # ------------------------------------------------------------
         # ПАРАЛЛЕЛЬНОЕ ОТКРЫТИЕ ОБЕИХ НОГ
         # ------------------------------------------------------------
+        long_params = self._build_order_params(long_ex, "buy", is_close=False, position_side="long")
+        short_params = self._build_order_params(short_ex, "sell", is_close=False, position_side="short")
+
+        logger.debug(f"📋 ENTRY PARAMS | LONG [{long_ex}]: {long_params}")
+        logger.debug(f"📋 ENTRY PARAMS | SHORT [{short_ex}]: {short_params}")
+
         long_task = self._order_with_retries(
             long_ex,
             symbol,
             "buy",
             volume,
             leg_label="entry_long",
-            params=self._build_order_params(long_ex, "buy", is_close=False, position_side="long"),
+            params=long_params,
         )
 
         short_task = self._order_with_retries(
@@ -1014,7 +1020,7 @@ class TradeEngine:
             "sell",
             volume,
             leg_label="entry_short",
-            params=self._build_order_params(short_ex, "sell", is_close=False, position_side="short"),
+            params=short_params,
         )
 
         long_order, short_order = await asyncio.gather(long_task, short_task)

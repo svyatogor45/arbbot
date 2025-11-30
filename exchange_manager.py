@@ -30,6 +30,14 @@ from symbol_mapper import to_ccxt_symbol, pretty
 # Оптимизировано: 300s → 3600s (лимиты бирж меняются очень редко)
 MARKET_INFO_CACHE_TTL = 3600  # 1 час
 
+# Время жизни кэша позиций (секунды)
+# Короткий TTL — позиции могут меняться, но повторные проверки за 2 сек используют кэш
+POSITION_CACHE_TTL = 2.0
+
+# Время жизни кэша баланса (секунды)
+# Баланс меняется только при открытии/закрытии позиций
+BALANCE_CACHE_TTL = 5.0
+
 # Интервал health check (секунды)
 HEALTH_CHECK_INTERVAL = 60
 
@@ -126,16 +134,22 @@ class ExchangeManager:
     def __init__(self, credentials_provider: Optional[Callable[[str], Dict[str, Any]]] = None):
         # Кеш активных инстансов бирж: { "bybit": <ccxt.bybit>, ... }
         self.active_exchanges: Dict[str, Any] = {}
-        
+
         # Функция для получения credentials
         self.credentials_provider = credentials_provider
-        
+
         # Кэш market info: { "bybit:BTC/USDT:USDT": CachedMarketInfo, ... }
         self._market_info_cache: Dict[str, CachedMarketInfo] = {}
-        
+
+        # Кэш позиций: { "bybit:BTC/USDT": (position_data, timestamp), ... }
+        self._position_cache: Dict[str, Tuple[Optional[Dict], float]] = {}
+
+        # Кэш балансов: { "bybit:USDT": (balance, timestamp), ... }
+        self._balance_cache: Dict[str, Tuple[Optional[float], float]] = {}
+
         # Метрики здоровья по биржам
         self._health: Dict[str, ExchangeHealth] = {}
-        
+
         # Lock для thread-safe создания инстансов
         self._create_lock = asyncio.Lock()
 
@@ -678,14 +692,28 @@ class ExchangeManager:
             return None
 
     async def get_free_balance(self, exchange_name: str, currency: str) -> Optional[float]:
-        """Получить свободный баланс по валюте."""
+        """Получить свободный баланс по валюте с кэшированием."""
+        name = self._normalize_name(exchange_name)
+        cache_key = f"{name}:{currency}"
+
+        # Проверяем кэш
+        cached = self._balance_cache.get(cache_key)
+        if cached:
+            balance, ts = cached
+            if time.time() - ts < BALANCE_CACHE_TTL:
+                return balance
+
         bal = await self.fetch_balance(exchange_name)
         if not bal:
             return None
 
         try:
             free = bal.get("free") or {}
-            return float(free.get(currency, 0.0))
+            result = float(free.get(currency, 0.0))
+
+            # Сохраняем в кэш
+            self._balance_cache[cache_key] = (result, time.time())
+            return result
         except Exception as e:
             logger.error(f"❌ get_free_balance({exchange_name}, {currency}): {e}")
             return None
@@ -705,32 +733,44 @@ class ExchangeManager:
 
     async def get_position(self, exchange_name: str, symbol: str) -> Optional[Dict[str, Any]]:
         """
-        Get position info for a symbol.
+        Get position info for a symbol with caching.
         Returns dict with keys: contracts, side, entryPrice, etc.
         Returns None if no position or error.
         """
+        name = self._normalize_name(exchange_name)
+        ccxt_symbol = to_ccxt_symbol(exchange_name, symbol)
+        cache_key = f"{name}:{ccxt_symbol}"
+
+        # Проверяем кэш
+        cached = self._position_cache.get(cache_key)
+        if cached:
+            position, ts = cached
+            if time.time() - ts < POSITION_CACHE_TTL:
+                return position
+
         exchange = await self.load_exchange(exchange_name)
         if not exchange:
             return None
 
-        name = self._normalize_name(exchange_name)
         health = self._get_health(name)
-        ccxt_symbol = to_ccxt_symbol(exchange_name, symbol)
 
         try:
             positions = await exchange.fetch_positions([ccxt_symbol])
             health.record_request(True)
 
-            if not positions:
-                return None
+            result = None
+            if positions:
+                for pos in positions:
+                    if pos.get("symbol") == ccxt_symbol:
+                        contracts = pos.get("contracts") or pos.get("contractSize") or 0
+                        if contracts and float(contracts) != 0:
+                            result = pos
+                            break
 
-            for pos in positions:
-                if pos.get("symbol") == ccxt_symbol:
-                    contracts = pos.get("contracts") or pos.get("contractSize") or 0
-                    if contracts and float(contracts) != 0:
-                        return pos
+            # Сохраняем в кэш (даже None — чтобы не дёргать биржу повторно)
+            self._position_cache[cache_key] = (result, time.time())
+            return result
 
-            return None
         except Exception as e:
             code = self._classify_exception(e)
             health.record_request(False, code)

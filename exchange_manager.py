@@ -795,18 +795,26 @@ class ExchangeManager:
         except Exception as e:
             code = self._classify_exception(e)
             health.record_request(False, code)
-            
+
             if code == "rate_limit":
                 health.rate_limit_hits += 1
 
+            # Полное сообщение об ошибке для отладки
+            full_error = str(e)
+            error_type = type(e).__name__
+
             logger.error(
-                f"❌ ORDER ERR [{exchange_name}] {side.upper()} {amount} {p_symbol}: "
-                f"{e} | code={code}"
+                f"❌ ORDER ERR [{exchange_name}] {side.upper()} {amount} {p_symbol} "
+                f"(ccxt={ccxt_symbol}): {error_type}: {full_error} | code={code}"
             )
+
+            # Дополнительно логируем params для отладки
+            logger.debug(f"   ORDER PARAMS: {params}")
+
             return {
                 "status": "error",
                 "data": None,
-                "msg": code,
+                "msg": f"{code}:{error_type}",
                 "filled": None,
                 "requested_amount": amount,
                 "average_price": None,

@@ -715,10 +715,10 @@ async def debug_websocket():
         for symbol, book in books.items():
             if book:
                 result["orderbooks"][ex][symbol] = {
-                    "has_bids": len(book.get("bids", [])) > 0,
-                    "has_asks": len(book.get("asks", [])) > 0,
-                    "best_bid": book.get("bids", [[0]])[0][0] if book.get("bids") else None,
-                    "best_ask": book.get("asks", [[0]])[0][0] if book.get("asks") else None,
+                    "has_bids": len(book.bids) > 0,
+                    "has_asks": len(book.asks) > 0,
+                    "best_bid": book.best_bid,
+                    "best_ask": book.best_ask,
                 }
 
     # Health info
@@ -741,13 +741,14 @@ async def debug_spread(symbol: str):
     # Get all orderbooks for this symbol
     orderbooks = {}
     for ex in trading_core.active_exchanges:
-        book = ws.get_orderbook(ex, symbol)
+        books = ws._orderbooks.get(ex, {})
+        book = books.get(symbol)
         if book:
             orderbooks[ex] = {
-                "best_bid": book.get("bids", [[0]])[0] if book.get("bids") else None,
-                "best_ask": book.get("asks", [[0]])[0] if book.get("asks") else None,
-                "bid_depth": len(book.get("bids", [])),
-                "ask_depth": len(book.get("asks", [])),
+                "best_bid": book.best_bid,
+                "best_ask": book.best_ask,
+                "bid_depth": len(book.bids),
+                "ask_depth": len(book.asks),
             }
 
     # Try to find opportunity

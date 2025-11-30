@@ -7,7 +7,7 @@ from dataclasses import dataclass, field
 from loguru import logger
 from config import DEAD_WS_TIMEOUT, TAKER_FEES, DEFAULT_TAKER_FEE
 
-SPREAD_CACHE_TTL = 0.5
+SPREAD_CACHE_TTL = 0.2  # FIX 6.2: было 0.5, ускорено для свежих данных
 EARLY_EXIT_SPREAD_THRESHOLD = 1.0
 
 @dataclass

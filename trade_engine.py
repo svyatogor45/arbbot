@@ -258,6 +258,22 @@ class TradeEngine:
         # Must be added regardless of hedge/one-way mode
         if ex == "okx":
             params["tdMode"] = "cross"  # cross margin mode
+            # В one_way режиме OKX требует posSide = "net"
+            if not is_hedge_mode:
+                params["posSide"] = "net"
+
+        # Bybit: в one_way режиме нужен positionIdx = 0
+        if ex == "bybit" and not is_hedge_mode:
+            params["positionIdx"] = 0
+
+        # BingX: в one_way режиме positionSide = "BOTH"
+        if ex == "bingx" and not is_hedge_mode:
+            params["positionSide"] = "BOTH"
+
+        # MEXC: в one_way режиме не передаём positionSide (или BOTH)
+        # Bitget: в one_way режиме не передаём holdSide
+        # Gate: в one_way режиме не нужны дополнительные параметры
+        # HTX: в one_way режиме не передаём direction
 
         # reduceOnly для закрытия позиций
         if is_close:

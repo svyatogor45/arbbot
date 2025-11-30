@@ -406,6 +406,9 @@ class TradingCore:
             logger.warning("No connected exchanges in DB, using all from config")
             self.active_exchanges = list(EXCHANGES)  # Copy to avoid modifying config.EXCHANGES
 
+        # Load API credentials for ExchangeManager
+        await self.ex_manager.load_credentials_from_db(self.db)
+
         # Initialize WsManager with only connected exchanges
         self.ws = WsManager(allowed_exchanges=self.active_exchanges)
         self.market = MarketEngine(self.ws)

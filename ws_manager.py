@@ -203,7 +203,7 @@ class WsManager:
         """Process callbacks with latest-wins backpressure. Old updates are dropped."""
         while self.running:
             try:
-                await asyncio.wait_for(self._pending_event.wait(), timeout=0.02)  # FIX 2.1: 20мс вместо 100мс
+                await asyncio.wait_for(self._pending_event.wait(), timeout=0.01)  # PERF: 10мс (было 20мс)
             except asyncio.TimeoutError:
                 continue
 

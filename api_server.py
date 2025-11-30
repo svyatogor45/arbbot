@@ -24,9 +24,6 @@ from db_manager import DBManager
 from exchange_manager import ExchangeManager
 from config import EXCHANGES, TAKER_FEES
 
-# DEBUG: Check EXCHANGES at module load time
-print(f"[API_SERVER LOAD] EXCHANGES at import time: {EXCHANGES}")
-
 # Project root directory (for absolute paths)
 PROJECT_ROOT = Path(__file__).parent.resolve()
 
@@ -265,7 +262,6 @@ async def serve_index():
 @app.get("/api/exchanges")
 async def get_exchanges():
     """Get list of all supported exchanges with connection status."""
-    logger.info(f"[DEBUG] get_exchanges called, EXCHANGES={EXCHANGES}, db={db}")
     connected = set(await db.get_connected_exchanges())
     result = []
 

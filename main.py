@@ -598,6 +598,31 @@ class TradingCore:
         """Get state of all monitored pairs for web display."""
         return [self.get_pair_state(pid) for pid in self.pair_states.keys()]
 
+    def pause_pair_immediate(self, pair_id: int) -> bool:
+        """
+        Immediately remove pair from monitoring (called when UI pauses a pair).
+        Returns True if pair was removed, False if pair has open position.
+        """
+        state = self.pair_states.get(pair_id)
+        if not state:
+            logger.debug(f"[{pair_id}] pause_pair_immediate: pair not in pair_states")
+            return True  # Not monitored anyway
+
+        # Don't remove if has open position - need to keep monitoring for exit
+        if state.filled_parts > 0:
+            logger.info(f"[{pair_id}] pause_pair_immediate: has open position, keeping for exit monitoring")
+            return False
+
+        # Remove from monitoring
+        symbol = state.symbol
+        del self.pair_states[pair_id]
+
+        if symbol in self.symbol_to_pairs:
+            self.symbol_to_pairs[symbol].discard(pair_id)
+
+        logger.info(f"[{pair_id}] pause_pair_immediate: removed from monitoring")
+        return True
+
     def can_remove_exchange(self, exchange: str) -> dict:
         """
         Check if exchange can be safely removed.
@@ -1339,6 +1364,7 @@ async def handle_state_ready(
 ):
     """READY state: look for entry opportunity using O(N) fast path."""
     if not state.is_flat:
+        logger.debug(f"[{state.pair_id}] SKIP: not flat (filled={state.filled_parts}, closed={state.closed_parts})")
         return
 
     symbol = state.symbol
@@ -1362,19 +1388,39 @@ async def handle_state_ready(
         )
 
     if not signal:
-        return
+        return  # Normal case - no spread opportunity
 
+    # ============================================================
+    # SIGNAL FOUND! Log everything from here
+    # ============================================================
+    raw_spread = signal.get("raw_spread_pct", 0)
+    net_spread = signal.get("net_full_spread_pct", 0)
     buy_ex = signal["buy_exchange"]
     sell_ex = signal["sell_exchange"]
 
+    logger.info(
+        f"📊 [{state.pair_id}] SIGNAL {symbol} | {buy_ex}→{sell_ex} | "
+        f"raw={raw_spread:.3f}% net={net_spread:.3f}% (need≥{state.entry_spread}%)"
+    )
+
     # Step 2: Health check - are both exchanges alive?
-    if not market.ws.is_healthy(buy_ex) or not market.ws.is_healthy(sell_ex):
-        return  # Don't enter if WebSocket is dead/stale
+    buy_healthy = market.ws.is_healthy(buy_ex)
+    sell_healthy = market.ws.is_healthy(sell_ex)
+    if not buy_healthy or not sell_healthy:
+        logger.warning(
+            f"⚠️ [{state.pair_id}] WS UNHEALTHY | {buy_ex}={buy_healthy}, {sell_ex}={sell_healthy}"
+        )
+        return
 
     # Step 3: Circuit breaker - is exchange temporarily disabled?
     if core:
-        if core.circuit_breaker_is_open(buy_ex) or core.circuit_breaker_is_open(sell_ex):
-            return  # Exchange disabled after consecutive errors
+        buy_cb = core.circuit_breaker_is_open(buy_ex)
+        sell_cb = core.circuit_breaker_is_open(sell_ex)
+        if buy_cb or sell_cb:
+            logger.warning(
+                f"⚠️ [{state.pair_id}] CIRCUIT BREAKER OPEN | {buy_ex}={buy_cb}, {sell_ex}={sell_cb}"
+            )
+            return
 
     # Step 4: First VWAP check (preliminary)
     first_check_time = time.time()
@@ -1386,18 +1432,31 @@ async def handle_state_ready(
     )
 
     if not verified_signal:
-        return  # Not enough liquidity in orderbook for our volume
+        logger.warning(
+            f"⚠️ [{state.pair_id}] VWAP CHECK FAILED | {symbol} {buy_ex}→{sell_ex} | "
+            f"Not enough liquidity for volume={monitor_volume}"
+        )
+        return
 
     real_spread = verified_signal["net_full_spread_pct"]
     if real_spread < state.entry_spread:
-        return  # After VWAP calculation, spread is below threshold
+        logger.info(
+            f"📉 [{state.pair_id}] VWAP SPREAD LOW | {symbol} | "
+            f"VWAP={real_spread:.3f}% < threshold={state.entry_spread}% (top-of-book was {net_spread:.3f}%)"
+        )
+        return
 
     # Step 5: Risk check
     planned_notional = estimate_planned_position_notional(state, verified_signal)
     allowed, reason = await risk_controller.try_acquire_entry_slot(planned_notional)
 
     if not allowed:
+        logger.warning(
+            f"🚫 [{state.pair_id}] RISK BLOCKED | {symbol} | reason={reason} | notional=${planned_notional:.2f}"
+        )
         return
+
+    logger.info(f"✅ [{state.pair_id}] RISK OK | {symbol} | notional=${planned_notional:.2f}")
 
     # Step 6: FINAL spread check (TOCTOU protection)
     # PERF: Если прошло < 50мс — используем первый результат (экономия 2-15мс)
@@ -1408,6 +1467,7 @@ async def handle_state_ready(
         final_spread = real_spread
     else:
         # Прошло > 50мс, перепроверяем спред
+        logger.debug(f"[{state.pair_id}] Re-checking spread after {time_since_first_check*1000:.0f}ms")
         final_signal = await market.check_spread(
             symbol=symbol,
             buy_exchange=buy_ex,
@@ -1417,15 +1477,19 @@ async def handle_state_ready(
 
         if not final_signal:
             await risk_controller.release_entry_slot(planned_notional)
+            logger.warning(f"⚠️ [{state.pair_id}] FINAL VWAP FAILED | {symbol} | liquidity gone")
             return
 
         final_spread = final_signal["net_full_spread_pct"]
         if final_spread < state.entry_spread:
             await risk_controller.release_entry_slot(planned_notional)
-            logger.debug(f"[{state.pair_id}] ENTRY ABORTED: spread dropped {real_spread:.3f}% -> {final_spread:.3f}%")
+            logger.info(f"📉 [{state.pair_id}] SPREAD DROPPED | {symbol} | {real_spread:.3f}% → {final_spread:.3f}%")
             return
 
-    logger.info(f"[{state.pair_id}] ENTRY {symbol} | {buy_ex}->{sell_ex} spread={final_spread}% (VWAP, verified)")
+    logger.info(
+        f"🚀 [{state.pair_id}] EXECUTING ENTRY | {symbol} | {buy_ex}→{sell_ex} | "
+        f"spread={final_spread:.3f}% vol={monitor_volume}"
+    )
 
     res = await trader.execute_entry(final_signal, monitor_volume, pair_id=state.pair_id, leverage=state.leverage)
 
@@ -1461,6 +1525,12 @@ async def handle_state_ready(
         # Сначала обновляем статус (мгновенно), потом сохраняем в DB асинхронно
         state.status = STATE_ENTERING if state.n_orders > 1 else STATE_HOLD
 
+        logger.info(
+            f"✅ [{state.pair_id}] ENTRY SUCCESS | {symbol} | "
+            f"LONG [{buy_ex}] {filled_long:.6f} @ {signal['buy_price']:.4f} | "
+            f"SHORT [{sell_ex}] {filled_short:.6f} @ {signal['sell_price']:.4f}"
+        )
+
         asyncio.create_task(_save_entry_background(
             db=db,
             pair_id=state.pair_id,
@@ -1477,8 +1547,13 @@ async def handle_state_ready(
         ))
     else:
         # Circuit breaker: record error
+        error_code = res.get("error") or "ENTRY_ERROR"
+        logger.error(
+            f"❌ [{state.pair_id}] ENTRY FAILED | {symbol} | error={error_code} | "
+            f"buy_ex={buy_ex} sell_ex={sell_ex}"
+        )
+
         if core:
-            error_code = res.get("error") or ""
             # Determine which exchange failed
             if "long" in error_code.lower() or "second_leg" in error_code.lower():
                 core.circuit_breaker_record_error(sell_ex)
@@ -1490,7 +1565,6 @@ async def handle_state_ready(
                 core.circuit_breaker_record_error(sell_ex)
 
         await risk_controller.release_entry_slot(planned_notional)
-        error_code = res.get("error") or "ENTRY_ERROR"
         if error_code == "second_leg_failed_emergency_close":
             state.status = STATE_PAUSED
             # FIX Problem 7: DB в background

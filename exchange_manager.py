@@ -27,7 +27,8 @@ from symbol_mapper import to_ccxt_symbol, pretty
 # ============================================================
 
 # Время жизни кэша market info (секунды)
-MARKET_INFO_CACHE_TTL = 300  # 5 минут
+# Оптимизировано: 300s → 3600s (лимиты бирж меняются очень редко)
+MARKET_INFO_CACHE_TTL = 3600  # 1 час
 
 # Интервал health check (секунды)
 HEALTH_CHECK_INTERVAL = 60

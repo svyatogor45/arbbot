@@ -5570,3 +5570,21 @@
 2025-11-30 17:37:28.139 | WARNING  | __main__:handle_signal:490 - 🛑 Received signal SIGINT, initiating shutdown...
 2025-11-30 17:37:29.486 | WARNING  | __main__:handle_signal:490 - 🛑 Received signal SIGINT, initiating shutdown...
 2025-11-30 17:37:33.362 | DEBUG    | ws_manager:_parse_orderbook:482 - [BYBIT RAW] {'success': True, 'ret_msg': 'pong', 'conn_id': 'd4anhtm9806ts1nl7570-4v3ya', 'req_id': '', 'op': 'ping'}
+2025-11-30 17:37:48.362 | DEBUG    | ws_manager:_parse_orderbook:482 - [BYBIT RAW] {'success': True, 'ret_msg': 'pong', 'conn_id': 'd4anhtm9806ts1nl7570-4v3ya', 'req_id': '', 'op': 'ping'}
+2025-11-30 17:37:52.951 | WARNING  | ws_manager:_process_message:455 - 🚨 LIQUIDATION [okx] GIGGLEUSDT | {'side': '', 'price': 0.0, 'qty': 0.0, 'timestamp': 1764524272.9512875, 'exchange': 'okx'}
+2025-11-30 17:38:03.362 | DEBUG    | ws_manager:_parse_orderbook:482 - [BYBIT RAW] {'success': True, 'ret_msg': 'pong', 'conn_id': 'd4anhtm9806ts1nl7570-4v3ya', 'req_id': '', 'op': 'ping'}
+2025-11-30 17:38:12.188 | WARNING  | ws_manager:_process_message:455 - 🚨 LIQUIDATION [okx] MOGUSDT | {'side': '', 'price': 0.0, 'qty': 0.0, 'timestamp': 1764524292.1881452, 'exchange': 'okx'}
+2025-11-30 17:38:12.190 | WARNING  | ws_manager:_process_message:455 - 🚨 LIQUIDATION [okx] MONUSDT | {'side': '', 'price': 0.0, 'qty': 0.0, 'timestamp': 1764524292.1901913, 'exchange': 'okx'}
+2025-11-30 17:38:12.737 | WARNING  | ws_manager:_process_message:455 - 🚨 LIQUIDATION [okx] MONUSDT | {'side': '', 'price': 0.0, 'qty': 0.0, 'timestamp': 1764524292.7370741, 'exchange': 'okx'}
+2025-11-30 17:38:14.103 | WARNING  | ws_manager:_process_message:455 - 🚨 LIQUIDATION [okx] MOGUSDT | {'side': '', 'price': 0.0, 'qty': 0.0, 'timestamp': 1764524294.1030996, 'exchange': 'okx'}
+2025-11-30 17:38:15.035 | WARNING  | ws_manager:_process_message:455 - 🚨 LIQUIDATION [okx] MOGUSDT | {'side': '', 'price': 0.0, 'qty': 0.0, 'timestamp': 1764524295.0354195, 'exchange': 'okx'}
+2025-11-30 17:38:15.677 | WARNING  | ws_manager:_process_message:455 - 🚨 LIQUIDATION [okx] GIGGLEUSDT | {'side': '', 'price': 0.0, 'qty': 0.0, 'timestamp': 1764524295.677262, 'exchange': 'okx'}
+2025-11-30 17:38:17.638 | WARNING  | ws_manager:_process_message:455 - 🚨 LIQUIDATION [okx] MOGUSDT | {'side': '', 'price': 0.0, 'qty': 0.0, 'timestamp': 1764524297.6382582, 'exchange': 'okx'}
+2025-11-30 17:38:18.363 | DEBUG    | ws_manager:_parse_orderbook:482 - [BYBIT RAW] {'success': True, 'ret_msg': 'pong', 'conn_id': 'd4anhtm9806ts1nl7570-4v3ya', 'req_id': '', 'op': 'ping'}
+2025-11-30 17:38:18.531 | WARNING  | ws_manager:_process_message:455 - 🚨 LIQUIDATION [okx] GIGGLEUSDT | {'side': '', 'price': 0.0, 'qty': 0.0, 'timestamp': 1764524298.5317101, 'exchange': 'okx'}
+2025-11-30 17:38:18.582 | WARNING  | ws_manager:_process_message:455 - 🚨 LIQUIDATION [okx] GIGGLEUSDT | {'side': '', 'price': 0.0, 'qty': 0.0, 'timestamp': 1764524298.5823374, 'exchange': 'okx'}
+2025-11-30 17:38:19.652 | WARNING  | ws_manager:_process_message:455 - 🚨 LIQUIDATION [okx] GIGGLEUSDT | {'side': '', 'price': 0.0, 'qty': 0.0, 'timestamp': 1764524299.6524868, 'exchange': 'okx'}
+2025-11-30 17:38:20.281 | WARNING  | ws_manager:_process_message:455 - 🚨 LIQUIDATION [okx] BTCUSDT | {'side': '', 'price': 0.0, 'qty': 0.0, 'timestamp': 1764524300.2816384, 'exchange': 'okx'}
+2025-11-30 17:38:20.629 | WARNING  | ws_manager:_process_message:455 - 🚨 LIQUIDATION [okx] GIGGLEUSDT | {'side': '', 'price': 0.0, 'qty': 0.0, 'timestamp': 1764524300.6298556, 'exchange': 'okx'}
+2025-11-30 17:38:22.781 | WARNING  | ws_manager:_process_message:455 - 🚨 LIQUIDATION [okx] GIGGLEUSDT | {'side': '', 'price': 0.0, 'qty': 0.0, 'timestamp': 1764524302.7811458, 'exchange': 'okx'}
+2025-11-30 17:38:33.366 | DEBUG    | ws_manager:_parse_orderbook:482 - [BYBIT RAW] {'success': True, 'ret_msg': 'pong', 'conn_id': 'd4anhtm9806ts1nl7570-4v3ya', 'req_id': '', 'op': 'ping'}

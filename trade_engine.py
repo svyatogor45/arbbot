@@ -33,7 +33,7 @@ from config import CRITICAL_IMBALANCE_PCT, WARNING_IMBALANCE_PCT
 # ============================================================
 
 # Базовая задержка для exponential backoff (секунды)
-BASE_RETRY_DELAY = 0.5
+BASE_RETRY_DELAY = 0.1  # FIX 3.2: было 0.5, ускорено для арбитража
 
 # Максимальная задержка между ретраями (секунды)
 MAX_RETRY_DELAY = 10.0

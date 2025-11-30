@@ -99,11 +99,31 @@ MAX_TOTAL_RISK_USDT = 50_000.0  # общий лимит риска по всем
 MAX_OPEN_PAIRS = 5  
 MAX_MONITORED_PAIRS = 30
 
-# Биржевой рынок (swap/futures/spot)  
+# Биржевой рынок (swap/futures/spot)
 DEFAULT_MARKET_TYPE = "swap"
 
-# Плечо по умолчанию (задел на будущее)  
+# Плечо по умолчанию (задел на будущее)
 DEFAULT_LEVERAGE = 10
+
+# ============================================================
+# РЕЖИМ ПОЗИЦИИ НА БИРЖАХ (hedge / one_way)
+# ============================================================
+# hedge - можно одновременно иметь LONG и SHORT позиции
+# one_way - только одна позиция (net position)
+#
+# ВАЖНО: Убедитесь что режим на бирже соответствует настройке здесь!
+# Для арбитража рекомендуется Hedge mode на всех биржах.
+
+POSITION_MODES = {
+    "bitget": "one_way",   # Если у вас One-way mode на Bitget
+    "bingx": "hedge",      # BingX в Hedge mode
+    "binance": "hedge",
+    "bybit": "hedge",
+    "okx": "hedge",
+    "gate": "hedge",
+    "mexc": "hedge",
+    "htx": "hedge",
+}
 
 # ============================================================  
 # ЛОГИРОВАНИЕ  

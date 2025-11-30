@@ -25,7 +25,7 @@ from loguru import logger
 from exchange_manager import ExchangeManager
 from db_manager import DBManager
 from symbol_mapper import normalize_base_quote
-from config import CRITICAL_IMBALANCE_PCT, WARNING_IMBALANCE_PCT
+from config import CRITICAL_IMBALANCE_PCT, WARNING_IMBALANCE_PCT, POSITION_MODES
 
 
 # ============================================================
@@ -212,9 +212,9 @@ class TradeEngine:
         """
         Формирует правильные params для ордера в зависимости от биржи.
 
-        ВАЖНО: Биржи должны быть настроены в Hedge mode для корректной работы!
+        Учитывает режим позиции (hedge/one_way) из config.POSITION_MODES.
 
-        Параметры для разных бирж:
+        Параметры для разных бирж (только в Hedge mode):
         - BingX/Binance: positionSide (LONG/SHORT)
         - Bitget: holdSide (long/short)
         - OKX: posSide (long/short)
@@ -226,8 +226,13 @@ class TradeEngine:
         params = {}
         ex = exchange.lower()
 
+        # Определяем режим позиции для биржи
+        position_mode = POSITION_MODES.get(ex, "hedge")  # по умолчанию hedge
+        is_hedge_mode = position_mode == "hedge"
+
         # Hedge mode: добавляем positionSide для каждой биржи
-        if position_side:
+        # В One-way mode НЕ передаём эти параметры!
+        if position_side and is_hedge_mode:
             ps = position_side.upper()
             ps_lower = position_side.lower()
 
@@ -250,14 +255,22 @@ class TradeEngine:
 
         # reduceOnly для закрытия позиций
         if is_close:
-            # Некоторые биржи используют разные параметры для reduceOnly
-            if ex == "okx":
+            # ВАЖНО: В Hedge mode для некоторых бирж reduceOnly НЕ совместим с positionSide
+            # Закрытие происходит через positionSide (BUY + positionSide=SHORT закрывает SHORT)
+            # В One-way mode reduceOnly нужен для всех бирж
+
+            if ex in ("bingx", "binance", "mexc"):
+                # В Hedge mode reduceOnly вызывает ошибку
+                # В One-way mode reduceOnly нужен
+                if not is_hedge_mode:
+                    params["reduceOnly"] = True
+            elif ex == "okx":
                 params["reduceOnly"] = True
             elif ex == "bitget":
-                params["reduceOnly"] = True
+                # Bitget: в One-way mode нужен reduceOnly
+                if not is_hedge_mode:
+                    params["reduceOnly"] = True
             elif ex == "bybit":
-                params["reduceOnly"] = True
-            elif ex in ("bingx", "binance", "mexc"):
                 params["reduceOnly"] = True
             elif ex == "htx":
                 # HTX может использовать offset вместо reduceOnly

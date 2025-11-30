@@ -1569,20 +1569,21 @@ async def handle_state_entering(
         state.actual_long_volume += filled_long
         state.actual_short_volume += filled_short
 
-        await db.save_position(
+        # FIX 1.2: DB операции в background - не блокируем критический путь
+        asyncio.create_task(db.save_position(
             pair_id=state.pair_id,
             long_exchange=state.long_exchange,
             short_exchange=state.short_exchange,
             filled_parts=state.filled_parts,
             closed_parts=state.closed_parts,
-            entry_prices_long=state.entry_prices_long,
-            entry_prices_short=state.entry_prices_short,
+            entry_prices_long=state.entry_prices_long.copy(),  # copy to avoid race
+            entry_prices_short=state.entry_prices_short.copy(),
             part_volume=state.part_volume,
-        )
+        ))
 
-        await db.log_trade_event(state.pair_id, "ENTRY_OK", "info",
+        asyncio.create_task(db.log_trade_event(state.pair_id, "ENTRY_OK", "info",
             f"Additional entry {symbol}: part {state.filled_parts}/{state.n_orders}",
-            {"volume": monitor_volume, "spread_pct": net_spread})
+            {"volume": monitor_volume, "spread_pct": net_spread}))
 
         if state.is_fully_entered:
             state.status = STATE_HOLD

@@ -647,6 +647,10 @@ async def update_settings(data: SettingsUpdate):
         await db.set_setting("max_monitored_pairs", str(data.max_monitored_pairs))
         updates["max_monitored_pairs"] = data.max_monitored_pairs
 
+    # FIX: Сброс кэша настроек — новые значения применяются МГНОВЕННО
+    if updates and trading_core:
+        trading_core.risk_controller.invalidate_cache()
+
     # Broadcast update
     await ws_manager.broadcast({
         "type": "settingsUpdate",

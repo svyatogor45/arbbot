@@ -33,7 +33,7 @@ from config import CRITICAL_IMBALANCE_PCT, WARNING_IMBALANCE_PCT
 # ============================================================
 
 # Базовая задержка для exponential backoff (секунды)
-BASE_RETRY_DELAY = 0.5
+BASE_RETRY_DELAY = 0.1  # FIX 3.2: было 0.5, ускорено для арбитража
 
 # Максимальная задержка между ретраями (секунды)
 MAX_RETRY_DELAY = 10.0
@@ -56,10 +56,10 @@ PARTIAL_FILL_WARNING_RATIO = 0.99  # 99%
 MAX_EMERGENCY_ATTEMPTS = 3
 
 # Таймаут на весь emergency close цикл (секунды)
-EMERGENCY_CLOSE_TIMEOUT = 60.0
+EMERGENCY_CLOSE_TIMEOUT = 20.0  # FIX 3.3: было 60, ускорено для быстрой эскалации
 
 # Задержка между emergency попытками (секунды)
-EMERGENCY_RETRY_DELAY = 2.0
+EMERGENCY_RETRY_DELAY = 0.5  # FIX 3.4: было 2.0, ускорено для быстрого закрытия
 
 
 class OrderResult(TypedDict, total=False):
@@ -318,9 +318,7 @@ class TradeEngine:
         # Биржа отклонит повторный ордер с тем же ID если первый уже исполнился
         client_order_id = self._generate_client_order_id(exchange, side)
 
-        # FIX: Запоминаем позицию ДО первого ордера для детекции исполнения
-        position_before = await self.manager.get_position(exchange, symbol)
-        contracts_before = abs(float(position_before.get("contracts", 0))) if position_before else 0.0
+        # FIX 3.1: Убрана проверка позиции - clientOrderId защищает от дублей
 
         for attempt in range(1, self.retry_attempts + 1):
             res = await self._order(
@@ -370,27 +368,8 @@ class TradeEngine:
                 )
                 return res
 
-            # FIX: Перед retry проверяем, не исполнился ли ордер на бирже
+            # FIX 3.1: Убрана проверка позиции перед retry - clientOrderId защищает от дублей
             if attempt < self.retry_attempts:
-                position_after = await self.manager.get_position(exchange, symbol)
-                contracts_after = abs(float(position_after.get("contracts", 0))) if position_after else 0.0
-
-                # Если позиция изменилась на ~amount — ордер уже исполнился
-                position_change = abs(contracts_after - contracts_before)
-                if position_change >= amount * 0.95:  # 95% tolerance
-                    logger.warning(
-                        f"⚠️ ORDER LIKELY EXECUTED despite error [{exchange}] {symbol} {side} "
-                        f"| position_before={contracts_before}, position_after={contracts_after} "
-                        f"| change={position_change}, requested={amount} | SKIPPING RETRY"
-                    )
-                    return OrderResult(
-                        status="filled",
-                        data={"detected_by": "position_check"},
-                        msg="order_executed_detected_by_position",
-                        filled=position_change,
-                        requested_amount=amount,
-                    )
-
                 delay = self._get_retry_delay(attempt)
                 logger.warning(
                     f"🔁 ORDER RETRY {attempt}/{self.retry_attempts} "

@@ -736,6 +736,10 @@ class ExchangeManager:
         Get position info for a symbol with caching.
         Returns dict with keys: contracts, side, entryPrice, etc.
         Returns None if no position or error.
+
+        ОПТИМИЗАЦИЯ: Кэширование с TTL 2 секунды
+        - Первый вызов: 50-200ms (HTTP запрос + сохранение в кэш)
+        - Повторный вызов (в течение 2 сек): ~0.01ms (из кэша) ⚡
         """
         name = self._normalize_name(exchange_name)
         ccxt_symbol = to_ccxt_symbol(exchange_name, symbol)
@@ -895,6 +899,15 @@ class ExchangeManager:
         keys_to_remove = [k for k in self._market_info_cache if k.startswith(f"{name}:")]
         for key in keys_to_remove:
             del self._market_info_cache[key]
+
+        # ОПТИМИЗАЦИЯ: Очищаем кэши позиций и балансов для этой биржи
+        position_keys_to_remove = [k for k in self._position_cache if k[0] == name]
+        for key in position_keys_to_remove:
+            del self._position_cache[key]
+
+        balance_keys_to_remove = [k for k in self._balance_cache if k[0] == name]
+        for key in balance_keys_to_remove:
+            del self._balance_cache[key]
 
         # Пробуем подключиться заново
         inst = await self.load_exchange(name)

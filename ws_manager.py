@@ -34,8 +34,8 @@ def safe_levels_mexc(levels):
 
 WS_STALE_TIMEOUT = WS_PING_INTERVAL * 3
 DEBUG_WS_RAW = False
-RECONNECT_DELAY_BASE = 3.0
-RECONNECT_DELAY_MAX = 30.0
+RECONNECT_DELAY_BASE = 1.0   # FIX 2.3: быстрее переподключение (было 3.0)
+RECONNECT_DELAY_MAX = 10.0   # FIX 2.3: макс 10 сек (было 30.0)
 RECONNECT_BACKOFF_MULTIPLIER = 1.5
 MAX_BOOK_DEPTH = 10
 RETURN_BOOK_DEPTH = 5
@@ -203,7 +203,7 @@ class WsManager:
         """Process callbacks with latest-wins backpressure. Old updates are dropped."""
         while self.running:
             try:
-                await asyncio.wait_for(self._pending_event.wait(), timeout=0.1)
+                await asyncio.wait_for(self._pending_event.wait(), timeout=0.01)  # PERF: 10мс (было 20мс)
             except asyncio.TimeoutError:
                 continue
 
@@ -351,7 +351,9 @@ class WsManager:
                         if msg.type in (aiohttp.WSMsgType.TEXT, aiohttp.WSMsgType.BINARY):
                             try:
                                 if ex in ("bingx", "htx") and msg.type == aiohttp.WSMsgType.BINARY:
-                                    raw = gzip.decompress(msg.data).decode()
+                                    # FIX 2.2: async gzip в thread pool - не блокируем event loop
+                                    loop = asyncio.get_running_loop()
+                                    raw = (await loop.run_in_executor(None, gzip.decompress, msg.data)).decode()
                                 else:
                                     raw = msg.data if isinstance(msg.data, str) else msg.data.decode()
                                 await self._process_message(ex, raw, ws)

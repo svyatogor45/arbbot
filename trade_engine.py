@@ -230,6 +230,11 @@ class TradeEngine:
         position_mode = POSITION_MODES.get(ex, "hedge")  # по умолчанию hedge
         is_hedge_mode = position_mode == "hedge"
 
+        logger.debug(
+            f"📋 BUILD PARAMS [{ex}] side={side} position_side={position_side} "
+            f"is_close={is_close} | config_mode={position_mode} is_hedge={is_hedge_mode}"
+        )
+
         # Hedge mode: добавляем positionSide для каждой биржи
         # В One-way mode НЕ передаём эти параметры!
         if position_side and is_hedge_mode:
@@ -1002,8 +1007,8 @@ class TradeEngine:
         long_params = self._build_order_params(long_ex, "buy", is_close=False, position_side="long")
         short_params = self._build_order_params(short_ex, "sell", is_close=False, position_side="short")
 
-        logger.debug(f"📋 ENTRY PARAMS | LONG [{long_ex}]: {long_params}")
-        logger.debug(f"📋 ENTRY PARAMS | SHORT [{short_ex}]: {short_params}")
+        logger.info(f"📋 ENTRY PARAMS | LONG [{long_ex}]: {long_params}")
+        logger.info(f"📋 ENTRY PARAMS | SHORT [{short_ex}]: {short_params}")
 
         long_task = self._order_with_retries(
             long_ex,

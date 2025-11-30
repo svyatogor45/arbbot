@@ -19,6 +19,7 @@ from config import (
     MAX_PAIR_VOLUME,
     MAX_OPEN_PAIRS,
     MAX_MONITORED_PAIRS,
+    POSITION_MODES,
 )
 
 from db_manager import DBManager
@@ -414,8 +415,37 @@ class TradingCore:
         self.market = MarketEngine(self.ws)
         self.trader = TradeEngine(self.ex_manager, self.db)
 
+        # Verify position modes match between config and actual exchange settings
+        await self._verify_position_modes()
+
         self._initialized = True
         logger.info("TradingCore initialized")
+
+    async def _verify_position_modes(self):
+        """
+        Verify that exchange account position modes match config.
+        Logs warnings if there's a mismatch.
+        """
+        logger.info("🔍 Verifying exchange position modes...")
+
+        for ex_name in self.active_exchanges:
+            ex = ex_name.lower()
+            config_mode = POSITION_MODES.get(ex, "hedge")
+
+            actual_mode = await self.ex_manager.check_position_mode(ex_name)
+
+            if actual_mode is None:
+                logger.warning(
+                    f"⚠️ [{ex}] Could not verify position mode (config={config_mode})"
+                )
+            elif actual_mode != config_mode:
+                logger.error(
+                    f"🚨 POSITION MODE MISMATCH [{ex}] | "
+                    f"config={config_mode} but actual={actual_mode} | "
+                    f"Change your {ex} account to {config_mode} mode, or update config.py!"
+                )
+            else:
+                logger.info(f"✅ [{ex}] Position mode OK: {actual_mode}")
 
     def circuit_breaker_record_error(self, exchange: str):
         """Record an error for circuit breaker."""

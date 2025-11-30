@@ -805,11 +805,8 @@ class ExchangeManager:
 
             logger.error(
                 f"❌ ORDER ERR [{exchange_name}] {side.upper()} {amount} {p_symbol} "
-                f"(ccxt={ccxt_symbol}): {error_type}: {full_error} | code={code}"
+                f"(ccxt={ccxt_symbol}): {error_type}: {full_error} | code={code} | params={params}"
             )
-
-            # Дополнительно логируем params для отладки
-            logger.debug(f"   ORDER PARAMS: {params}")
 
             return {
                 "status": "error",
@@ -974,6 +971,82 @@ class ExchangeManager:
 
             logger.warning(f"⚠️ set_leverage failed [{exchange_name}] {symbol}: {e} | code={code}")
             return False
+
+    async def check_position_mode(self, exchange_name: str) -> Optional[str]:
+        """
+        Check the account's position mode (hedge/one_way) via API.
+
+        Returns:
+            "hedge" - if account is in hedge mode (can have LONG + SHORT simultaneously)
+            "one_way" - if account is in one-way/net mode
+            None - if unable to determine
+        """
+        exchange = await self.load_exchange(exchange_name)
+        if not exchange:
+            return None
+
+        name = self._normalize_name(exchange_name)
+
+        try:
+            if name == "bitget":
+                # Bitget: use private API to get account info
+                # The /api/mix/v1/account/accounts endpoint returns dualSidePosition field
+                result = await exchange.private_mix_get_account_accounts({
+                    "productType": "umcbl"  # USDT-M perpetual
+                })
+                if result and "data" in result:
+                    accounts = result.get("data", [])
+                    if accounts:
+                        # dualSidePosition: true = hedge mode, false = one-way
+                        dual_side = accounts[0].get("dualSidePosition")
+                        mode = "hedge" if dual_side else "one_way"
+                        logger.info(f"🔍 POSITION MODE [{name}] = {mode} (dualSidePosition={dual_side})")
+                        return mode
+
+            elif name == "bingx":
+                # BingX: use /openApi/swap/v2/user/positionSide/dual
+                result = await exchange.private_swap_v2_user_get_positionside_dual()
+                if result:
+                    dual_side = result.get("dualSidePosition")
+                    mode = "hedge" if dual_side else "one_way"
+                    logger.info(f"🔍 POSITION MODE [{name}] = {mode} (dualSidePosition={dual_side})")
+                    return mode
+
+            elif name == "okx":
+                # OKX: use /api/v5/account/config
+                result = await exchange.private_get_account_config()
+                if result and "data" in result:
+                    data = result.get("data", [{}])[0]
+                    pos_mode = data.get("posMode")  # long_short_mode or net_mode
+                    mode = "hedge" if pos_mode == "long_short_mode" else "one_way"
+                    logger.info(f"🔍 POSITION MODE [{name}] = {mode} (posMode={pos_mode})")
+                    return mode
+
+            elif name == "bybit":
+                # Bybit: check via position info
+                # In hedge mode, positionIdx can be 1 or 2
+                # In one-way mode, positionIdx is always 0
+                result = await exchange.private_get_v5_position_list({
+                    "category": "linear", "settleCoin": "USDT", "limit": 1
+                })
+                if result and "result" in result:
+                    positions = result["result"].get("list", [])
+                    # If any position has positionIdx != 0, it's hedge mode
+                    for pos in positions:
+                        idx = pos.get("positionIdx", 0)
+                        if idx != 0:
+                            logger.info(f"🔍 POSITION MODE [{name}] = hedge (positionIdx={idx})")
+                            return "hedge"
+                    # Default assume one-way if no hedge positions found
+                    logger.info(f"🔍 POSITION MODE [{name}] = unknown (no positions with positionIdx)")
+                    return None
+
+            logger.warning(f"⚠️ check_position_mode not implemented for {name}")
+            return None
+
+        except Exception as e:
+            logger.warning(f"⚠️ check_position_mode failed [{name}]: {e}")
+            return None
 
     # ============================================================
     # HEALTH & METRICS

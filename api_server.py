@@ -683,6 +683,86 @@ async def clear_notifications():
     await db.clear_trade_events()
     return {"success": True}
 
+
+@app.get("/api/debug/ws")
+async def debug_websocket():
+    """Debug WebSocket status and orderbooks."""
+    if not trading_core:
+        return {"error": "Trading core not initialized"}
+
+    ws = trading_core.ws
+    result = {
+        "running": ws.running,
+        "active_exchanges": list(ws._allowed) if ws._allowed else [],
+        "connections": {},
+        "subscriptions": {},
+        "orderbooks": {},
+    }
+
+    # Connection status per exchange
+    for ex, conn in ws.connections.items():
+        result["connections"][ex] = {
+            "connected": conn is not None and not conn.closed,
+        }
+
+    # Subscriptions per exchange
+    for ex, subs in ws.subscriptions.items():
+        result["subscriptions"][ex] = list(subs)
+
+    # Orderbook data sample
+    for ex, books in ws._orderbooks.items():
+        result["orderbooks"][ex] = {}
+        for symbol, book in books.items():
+            if book:
+                result["orderbooks"][ex][symbol] = {
+                    "has_bids": len(book.get("bids", [])) > 0,
+                    "has_asks": len(book.get("asks", [])) > 0,
+                    "best_bid": book.get("bids", [[0]])[0][0] if book.get("bids") else None,
+                    "best_ask": book.get("asks", [[0]])[0][0] if book.get("asks") else None,
+                }
+
+    # Health info
+    result["health"] = {}
+    for ex, health in ws._health.items():
+        result["health"][ex] = health.to_dict()
+
+    return result
+
+
+@app.get("/api/debug/spread/{symbol}")
+async def debug_spread(symbol: str):
+    """Debug spread calculation for a symbol."""
+    if not trading_core:
+        return {"error": "Trading core not initialized"}
+
+    market = trading_core.market
+    ws = trading_core.ws
+
+    # Get all orderbooks for this symbol
+    orderbooks = {}
+    for ex in trading_core.active_exchanges:
+        book = ws.get_orderbook(ex, symbol)
+        if book:
+            orderbooks[ex] = {
+                "best_bid": book.get("bids", [[0]])[0] if book.get("bids") else None,
+                "best_ask": book.get("asks", [[0]])[0] if book.get("asks") else None,
+                "bid_depth": len(book.get("bids", [])),
+                "ask_depth": len(book.get("asks", [])),
+            }
+
+    # Try to find opportunity
+    try:
+        opportunity = market.find_best_opportunity_fast(symbol, 100.0, 0.0)
+    except Exception as e:
+        opportunity = {"error": str(e)}
+
+    return {
+        "symbol": symbol,
+        "active_exchanges": trading_core.active_exchanges,
+        "orderbooks": orderbooks,
+        "opportunity": opportunity,
+    }
+
 # ============================================================
 # WEBSOCKET
 # ============================================================

@@ -39,7 +39,7 @@ STATE_PAUSED = "PAUSED"
 STATE_ERROR = "ERROR"
 
 # Event-driven settings
-EVENT_DEBOUNCE_MS = 15  # Минимальный интервал между обработками (снижен с 50ms для быстрой реакции)
+EVENT_DEBOUNCE_MS = 5  # Минимальный интервал между обработками (снижен для быстрой реакции)
 POSITION_CHECK_INTERVAL = 0.5  # Интервал проверки SL/TP для позиций в HOLD
 POSITION_VALIDATION_INTERVAL = 30.0  # FIX Problem 1: Интервал сверки позиций с биржами (сек)
 
@@ -1569,20 +1569,21 @@ async def handle_state_entering(
         state.actual_long_volume += filled_long
         state.actual_short_volume += filled_short
 
-        await db.save_position(
+        # FIX 1.2: DB операции в background - не блокируем критический путь
+        asyncio.create_task(db.save_position(
             pair_id=state.pair_id,
             long_exchange=state.long_exchange,
             short_exchange=state.short_exchange,
             filled_parts=state.filled_parts,
             closed_parts=state.closed_parts,
-            entry_prices_long=state.entry_prices_long,
-            entry_prices_short=state.entry_prices_short,
+            entry_prices_long=state.entry_prices_long.copy(),  # copy to avoid race
+            entry_prices_short=state.entry_prices_short.copy(),
             part_volume=state.part_volume,
-        )
+        ))
 
-        await db.log_trade_event(state.pair_id, "ENTRY_OK", "info",
+        asyncio.create_task(db.log_trade_event(state.pair_id, "ENTRY_OK", "info",
             f"Additional entry {symbol}: part {state.filled_parts}/{state.n_orders}",
-            {"volume": monitor_volume, "spread_pct": net_spread})
+            {"volume": monitor_volume, "spread_pct": net_spread}))
 
         if state.is_fully_entered:
             state.status = STATE_HOLD
@@ -1698,13 +1699,14 @@ async def handle_state_hold(
         res = await trader.execute_exit(position_info, open_volume)
 
         if res["success"]:
-            await db.update_pair_pnl(state.pair_id, total_pnl)
-            await db.increment_sl(state.pair_id)
-            await db.update_pair_status(state.pair_id, "paused")
-            await db.log_trade_event(state.pair_id, "SL_TRIGGERED", "error",
+            # FIX 1.3: DB операции в background - не блокируем после SL
+            asyncio.create_task(db.update_pair_pnl(state.pair_id, total_pnl))
+            asyncio.create_task(db.increment_sl(state.pair_id))
+            asyncio.create_task(db.update_pair_status(state.pair_id, "paused"))
+            asyncio.create_task(db.log_trade_event(state.pair_id, "SL_TRIGGERED", "error",
                 f"SL on {symbol}: PnL={total_pnl:.2f}$, pair paused",
-                {"pnl": total_pnl, "stop_loss": state.stop_loss})
-            await db.delete_position(state.pair_id)
+                {"pnl": total_pnl, "stop_loss": state.stop_loss}))
+            asyncio.create_task(db.delete_position(state.pair_id))
             state.reset_after_exit()
             state.status = STATE_PAUSED
         else:

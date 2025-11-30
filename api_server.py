@@ -24,6 +24,9 @@ from db_manager import DBManager
 from exchange_manager import ExchangeManager
 from config import EXCHANGES, TAKER_FEES
 
+# DEBUG: Check EXCHANGES at module load time
+print(f"[API_SERVER LOAD] EXCHANGES at import time: {EXCHANGES}")
+
 # Project root directory (for absolute paths)
 PROJECT_ROOT = Path(__file__).parent.resolve()
 

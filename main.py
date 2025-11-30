@@ -401,10 +401,10 @@ class TradingCore:
         connected = await self.db.get_connected_exchanges()
         if connected:
             logger.info(f"Connected exchanges from DB: {connected}")
-            self.active_exchanges = connected
+            self.active_exchanges = list(connected)  # Copy to avoid modifying original
         else:
             logger.warning("No connected exchanges in DB, using all from config")
-            self.active_exchanges = EXCHANGES
+            self.active_exchanges = list(EXCHANGES)  # Copy to avoid modifying config.EXCHANGES
 
         # Initialize WsManager with only connected exchanges
         self.ws = WsManager(allowed_exchanges=self.active_exchanges)

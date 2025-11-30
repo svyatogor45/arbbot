@@ -258,9 +258,8 @@ class TradeEngine:
         # Must be added regardless of hedge/one-way mode
         if ex == "okx":
             params["tdMode"] = "cross"  # cross margin mode
-            # В one_way режиме OKX требует posSide = "net"
-            if not is_hedge_mode:
-                params["posSide"] = "net"
+            # В one_way режиме OKX НЕ нужен posSide (не передаём его)
+            # В hedge режиме posSide уже добавлен выше
 
         # Bybit: в one_way режиме нужен positionIdx = 0
         if ex == "bybit" and not is_hedge_mode:

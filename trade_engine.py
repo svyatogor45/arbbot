@@ -295,16 +295,19 @@ class TradeEngine:
         """
         Генерирует уникальный clientOrderId для дедупликации ордеров.
 
-        Формат: ARB_{exchange}_{side}_{timestamp_ms}_{uuid4_short}
-        Пример: ARB_bybi_b_170123456_a1b2c3d4 (max 32 chars for OKX)
-
-        Большинство бирж поддерживают clientOrderId до 32-36 символов.
-        OKX требует max 32 символа.
+        Формат зависит от биржи:
+        - OKX: только буквы и цифры (без underscore!), max 32 символа
+        - Остальные: ARB_{exchange}_{side}_{timestamp}_{uuid}
         """
         ts = str(int(time.time() * 1000))[-9:]  # last 9 digits
         short_uuid = uuid.uuid4().hex[:6]
-        ex_short = exchange[:4]
+        ex_short = exchange[:4].lower()
         side_short = side[0]  # 'b' or 's'
+
+        # OKX не принимает underscore в clOrdId - используем только буквы и цифры
+        if exchange.lower() == "okx":
+            return f"arb{ex_short}{side_short}{ts}{short_uuid}"  # без underscore
+
         return f"ARB_{ex_short}_{side_short}_{ts}_{short_uuid}"
 
     async def _order(

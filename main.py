@@ -39,7 +39,7 @@ STATE_PAUSED = "PAUSED"
 STATE_ERROR = "ERROR"
 
 # Event-driven settings
-EVENT_DEBOUNCE_MS = 5  # Минимальный интервал между обработками (оптимизировано: 50ms → 15ms → 5ms)
+EVENT_DEBOUNCE_MS = 15  # Минимальный интервал между обработками (5ms слишком агрессивно — пропускает апдейты)
 POSITION_CHECK_INTERVAL = 0.5  # Интервал проверки SL/TP для позиций в HOLD
 POSITION_VALIDATION_INTERVAL = 30.0  # FIX Problem 1: Интервал сверки позиций с биржами (сек)
 

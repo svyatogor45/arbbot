@@ -1364,6 +1364,7 @@ async def handle_state_ready(
             return  # Exchange disabled after consecutive errors
 
     # Step 4: First VWAP check (preliminary)
+    first_check_time = time.time()
     verified_signal = await market.check_spread(
         symbol=symbol,
         buy_exchange=buy_ex,
@@ -1385,24 +1386,31 @@ async def handle_state_ready(
     if not allowed:
         return
 
-    # FIX: Step 6 - FINAL spread check immediately before execution (TOCTOU protection)
-    # Спред мог измениться за время risk check, проверяем ещё раз
-    final_signal = await market.check_spread(
-        symbol=symbol,
-        buy_exchange=buy_ex,
-        sell_exchange=sell_ex,
-        volume_in_coin=monitor_volume,
-    )
+    # Step 6: FINAL spread check (TOCTOU protection)
+    # PERF: Если прошло < 50мс — используем первый результат (экономия 2-15мс)
+    time_since_first_check = time.time() - first_check_time
+    if time_since_first_check < 0.05:
+        # Данные ещё свежие, не тратим время на повторный запрос
+        final_signal = verified_signal
+        final_spread = real_spread
+    else:
+        # Прошло > 50мс, перепроверяем спред
+        final_signal = await market.check_spread(
+            symbol=symbol,
+            buy_exchange=buy_ex,
+            sell_exchange=sell_ex,
+            volume_in_coin=monitor_volume,
+        )
 
-    if not final_signal:
-        await risk_controller.release_entry_slot(planned_notional)
-        return
+        if not final_signal:
+            await risk_controller.release_entry_slot(planned_notional)
+            return
 
-    final_spread = final_signal["net_full_spread_pct"]
-    if final_spread < state.entry_spread:
-        await risk_controller.release_entry_slot(planned_notional)
-        logger.debug(f"[{state.pair_id}] ENTRY ABORTED: spread dropped {real_spread:.3f}% -> {final_spread:.3f}%")
-        return
+        final_spread = final_signal["net_full_spread_pct"]
+        if final_spread < state.entry_spread:
+            await risk_controller.release_entry_slot(planned_notional)
+            logger.debug(f"[{state.pair_id}] ENTRY ABORTED: spread dropped {real_spread:.3f}% -> {final_spread:.3f}%")
+            return
 
     logger.info(f"[{state.pair_id}] ENTRY {symbol} | {buy_ex}->{sell_ex} spread={final_spread}% (VWAP, verified)")
 

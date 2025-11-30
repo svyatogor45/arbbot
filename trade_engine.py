@@ -202,18 +202,47 @@ class TradeEngine:
     # НИЗКОУРОВНЕВЫЙ ХЕЛПЕР ДЛЯ ОРДЕРОВ
     # ============================================================
 
+    def _build_order_params(
+        self,
+        exchange: str,
+        side: str,
+        is_close: bool = False
+    ) -> dict:
+        """
+        Формирует правильные params для ордера в зависимости от биржи.
+
+        Для One-way mode (рекомендуется для арбитража):
+        - reduceOnly для закрытия позиций
+
+        Для Hedge mode (если биржа настроена так):
+        - positionSide: LONG для buy/sell long
+        - positionSide: SHORT для buy/sell short
+        """
+        params = {}
+        ex = exchange.lower()
+
+        if is_close:
+            # Закрытие позиции
+            params["reduceOnly"] = True
+        # Для открытия позиции не передаём reduceOnly (по умолчанию False)
+
+        return params
+
     def _generate_client_order_id(self, exchange: str, side: str) -> str:
         """
         Генерирует уникальный clientOrderId для дедупликации ордеров.
 
         Формат: ARB_{exchange}_{side}_{timestamp_ms}_{uuid4_short}
-        Пример: ARB_bybit_buy_1701234567890_a1b2c3d4
+        Пример: ARB_bybi_b_170123456_a1b2c3d4 (max 32 chars for OKX)
 
         Большинство бирж поддерживают clientOrderId до 32-36 символов.
+        OKX требует max 32 символа.
         """
-        ts = int(time.time() * 1000)
-        short_uuid = uuid.uuid4().hex[:8]
-        return f"ARB_{exchange[:4]}_{side}_{ts}_{short_uuid}"
+        ts = str(int(time.time() * 1000))[-9:]  # last 9 digits
+        short_uuid = uuid.uuid4().hex[:6]
+        ex_short = exchange[:4]
+        side_short = side[0]  # 'b' or 's'
+        return f"ARB_{ex_short}_{side_short}_{ts}_{short_uuid}"
 
     async def _order(
         self,
@@ -576,7 +605,7 @@ class TradeEngine:
                 side=side,
                 amount=remaining_amount,
                 leg_label=f"{leg_label}_attempt{attempt}",
-                params={"reduceOnly": True},
+                params=self._build_order_params(exchange, side, is_close=True),
             )
             last_order = close_order
 
@@ -883,7 +912,7 @@ class TradeEngine:
             "buy",
             volume,
             leg_label="entry_long",
-            params={"reduceOnly": False},
+            params=self._build_order_params(long_ex, "buy", is_close=False),
         )
 
         short_task = self._order_with_retries(
@@ -892,7 +921,7 @@ class TradeEngine:
             "sell",
             volume,
             leg_label="entry_short",
-            params={"reduceOnly": False},
+            params=self._build_order_params(short_ex, "sell", is_close=False),
         )
 
         long_order, short_order = await asyncio.gather(long_task, short_task)
@@ -995,7 +1024,7 @@ class TradeEngine:
             long_order = await self._fill_remaining(
                 long_ex, symbol, "buy", volume, long_filled,
                 leg_label="entry_long",
-                params={"reduceOnly": False},
+                params=self._build_order_params(long_ex, "buy", is_close=False),
             )
             long_filled = long_order.get("filled") or long_filled
 
@@ -1008,7 +1037,7 @@ class TradeEngine:
             short_order = await self._fill_remaining(
                 short_ex, symbol, "sell", volume, short_filled,
                 leg_label="entry_short",
-                params={"reduceOnly": False},
+                params=self._build_order_params(short_ex, "sell", is_close=False),
             )
             short_filled = short_order.get("filled") or short_filled
 
@@ -1195,16 +1224,16 @@ class TradeEngine:
             "sell",
             long_amount,
             leg_label="exit_long",
-            params={"reduceOnly": True},
+            params=self._build_order_params(long_ex, "sell", is_close=True),
         )
-        
+
         short_task = self._order_with_retries(
             short_ex,
             symbol,
             "buy",
             short_amount,
             leg_label="exit_short",
-            params={"reduceOnly": True},
+            params=self._build_order_params(short_ex, "buy", is_close=True),
         )
 
         long_order, short_order = await asyncio.gather(long_task, short_task)

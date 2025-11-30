@@ -59,7 +59,7 @@ MAX_EMERGENCY_ATTEMPTS = 3
 EMERGENCY_CLOSE_TIMEOUT = 20.0  # FIX 3.3: было 60, ускорено для быстрой эскалации
 
 # Задержка между emergency попытками (секунды)
-EMERGENCY_RETRY_DELAY = 2.0
+EMERGENCY_RETRY_DELAY = 0.5  # FIX 3.4: было 2.0, ускорено для быстрого закрытия
 
 
 class OrderResult(TypedDict, total=False):

@@ -212,12 +212,16 @@ class TradeEngine:
         """
         Формирует правильные params для ордера в зависимости от биржи.
 
-        Для One-way mode:
-        - reduceOnly для закрытия позиций
+        ВАЖНО: Биржи должны быть настроены в Hedge mode для корректной работы!
 
-        Для Hedge mode:
-        - positionSide: LONG/SHORT обязательно
-        - reduceOnly для закрытия
+        Параметры для разных бирж:
+        - BingX/Binance: positionSide (LONG/SHORT)
+        - Bitget: holdSide (long/short)
+        - OKX: posSide (long/short)
+        - Bybit: positionIdx (1=long, 2=short)
+        - HTX: direction (buy/sell для открытия, sell/buy для закрытия)
+        - Gate: auto_size для закрытия
+        - MEXC: positionSide (LONG/SHORT)
         """
         params = {}
         ex = exchange.lower()
@@ -225,17 +229,43 @@ class TradeEngine:
         # Hedge mode: добавляем positionSide для каждой биржи
         if position_side:
             ps = position_side.upper()
-            if ex in ("bingx", "binance"):
-                params["positionSide"] = ps
-            elif ex == "bitget":
-                params["holdSide"] = ps.lower()  # bitget: long/short lowercase
-            elif ex == "okx":
-                params["posSide"] = ps.lower()  # okx: long/short lowercase
-            elif ex == "bybit":
-                params["positionIdx"] = 1 if ps == "LONG" else 2  # bybit: 1=long, 2=short
+            ps_lower = position_side.lower()
 
+            if ex in ("bingx", "binance", "mexc"):
+                params["positionSide"] = ps  # LONG/SHORT
+            elif ex == "bitget":
+                params["holdSide"] = ps_lower  # long/short
+            elif ex == "okx":
+                params["posSide"] = ps_lower  # long/short (net for one-way)
+            elif ex == "bybit":
+                # Bybit Hedge mode: positionIdx 1=Buy side(LONG), 2=Sell side(SHORT)
+                params["positionIdx"] = 1 if ps == "LONG" else 2
+            elif ex == "htx":
+                # HTX uses direction parameter
+                params["direction"] = ps_lower  # long/short
+            elif ex == "gate":
+                # Gate uses auto_size for closing in hedge mode
+                if is_close:
+                    params["auto_size"] = ps_lower  # close_long/close_short
+
+        # reduceOnly для закрытия позиций
         if is_close:
-            params["reduceOnly"] = True
+            # Некоторые биржи используют разные параметры для reduceOnly
+            if ex == "okx":
+                params["reduceOnly"] = True
+            elif ex == "bitget":
+                params["reduceOnly"] = True
+            elif ex == "bybit":
+                params["reduceOnly"] = True
+            elif ex in ("bingx", "binance", "mexc"):
+                params["reduceOnly"] = True
+            elif ex == "htx":
+                # HTX может использовать offset вместо reduceOnly
+                params["offset"] = "close"
+            elif ex == "gate":
+                params["reduce_only"] = True  # Gate uses underscore
+            else:
+                params["reduceOnly"] = True  # default
 
         return params
 
@@ -284,9 +314,19 @@ class TradeEngine:
             )
 
         # FIX #4: Генерируем clientOrderId если не передан
+        # Разные биржи используют разные имена параметров
         order_params = dict(params) if params else {}
         coid = client_order_id or self._generate_client_order_id(exchange, side)
-        order_params["clientOrderId"] = coid
+        ex = exchange.lower()
+
+        # Биржеспецифичные имена для clientOrderId
+        if ex == "okx":
+            order_params["clOrdId"] = coid  # OKX uses clOrdId
+        elif ex == "gate":
+            order_params["text"] = coid  # Gate uses text
+        elif ex in ("bybit", "bitget", "bingx", "binance", "mexc", "htx"):
+            order_params["clientOrderId"] = coid
+        # Для остальных бирж не добавляем (может вызвать ошибку)
 
         try:
             raw = await self.manager.place_order(

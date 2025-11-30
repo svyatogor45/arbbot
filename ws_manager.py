@@ -351,7 +351,9 @@ class WsManager:
                         if msg.type in (aiohttp.WSMsgType.TEXT, aiohttp.WSMsgType.BINARY):
                             try:
                                 if ex in ("bingx", "htx") and msg.type == aiohttp.WSMsgType.BINARY:
-                                    raw = gzip.decompress(msg.data).decode()
+                                    # FIX 2.2: async gzip в thread pool - не блокируем event loop
+                                    loop = asyncio.get_running_loop()
+                                    raw = (await loop.run_in_executor(None, gzip.decompress, msg.data)).decode()
                                 else:
                                     raw = msg.data if isinstance(msg.data, str) else msg.data.decode()
                                 await self._process_message(ex, raw, ws)

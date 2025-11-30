@@ -116,16 +116,16 @@ DEFAULT_LEVERAGE = 10
 
 POSITION_MODES = {
     # ВАЖНО: Режим должен соответствовать настройке на аккаунте биржи!
-    # one_way = односторонняя позиция (net position) - более универсальный
+    # one_way = односторонняя позиция (net position)
     # hedge = двусторонняя позиция (можно LONG и SHORT одновременно)
-    "bitget": "one_way",   # One-way mode (unilateral position)
-    "bingx": "one_way",    # One-way mode
-    "binance": "one_way",
-    "bybit": "one_way",
-    "okx": "one_way",      # One-way mode (net position)
-    "gate": "one_way",
-    "mexc": "one_way",
-    "htx": "one_way",
+    "bitget": "hedge",
+    "bingx": "hedge",
+    "binance": "hedge",
+    "bybit": "hedge",
+    "okx": "hedge",
+    "gate": "hedge",
+    "mexc": "hedge",
+    "htx": "hedge",
 }
 
 # ============================================================  

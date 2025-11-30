@@ -80,7 +80,7 @@ class DBManager:
                     await self._conn.execute("PRAGMA synchronous = NORMAL;")
                     await self._conn.execute("PRAGMA cache_size = -64000;")
                     await self._conn.execute("PRAGMA temp_store = MEMORY;")
-                    await self._conn.execute("PRAGMA busy_timeout = 5000;")
+                    await self._conn.execute("PRAGMA busy_timeout = 1000;")  # FIX 4.1: было 5000
 
                     self._initialized = True
         return self._conn

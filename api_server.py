@@ -502,6 +502,10 @@ async def pause_pair(pair_id: int):
 
     await db.update_pair_status(pair_id, "paused")
 
+    # Immediately remove from TradingCore monitoring (if no open position)
+    if trading_core:
+        trading_core.pause_pair_immediate(pair_id)
+
     pair = await db.get_pair_by_id(pair_id)
     state = trading_core.get_pair_state(pair_id) if trading_core else None
 

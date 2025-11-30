@@ -689,14 +689,40 @@ class ExchangeManager:
             return None
 
     async def get_free_balance(self, exchange_name: str, currency: str) -> Optional[float]:
-        """Получить свободный баланс по валюте."""
+        """
+        Получить свободный баланс по валюте.
+
+        ОПТИМИЗАЦИЯ: Кэширование с TTL 10 секунд
+        - Первый вызов: 50-200ms (HTTP запрос + сохранение в кэш)
+        - Повторный вызов (в течение 10 сек): ~0.01ms (из кэша) ⚡
+        """
+        name = self._normalize_name(exchange_name)
+
+        # ОПТИМИЗАЦИЯ: Проверяем кэш балансов
+        cache_key = (name, currency)
+        cached = self._balance_cache.get(cache_key)
+
+        if cached is not None:
+            balance, timestamp = cached
+            age = time.time() - timestamp
+            if age < BALANCE_CACHE_TTL:
+                # Кэш свежий - возвращаем без запроса на биржу
+                return balance
+
+        # Кэш устарел или отсутствует - запрашиваем с биржи
         bal = await self.fetch_balance(exchange_name)
         if not bal:
             return None
 
         try:
             free = bal.get("free") or {}
-            return float(free.get(currency, 0.0))
+            result_balance = float(free.get(currency, 0.0))
+
+            # ОПТИМИЗАЦИЯ: Сохраняем в кэш
+            self._balance_cache[cache_key] = (result_balance, time.time())
+
+            return result_balance
+
         except Exception as e:
             logger.error(f"❌ get_free_balance({exchange_name}, {currency}): {e}")
             return None
@@ -719,12 +745,29 @@ class ExchangeManager:
         Get position info for a symbol.
         Returns dict with keys: contracts, side, entryPrice, etc.
         Returns None if no position or error.
+
+        ОПТИМИЗАЦИЯ: Кэширование с TTL 2 секунды
+        - Первый вызов: 50-200ms (HTTP запрос + сохранение в кэш)
+        - Повторный вызов (в течение 2 сек): ~0.01ms (из кэша) ⚡
         """
+        name = self._normalize_name(exchange_name)
+
+        # ОПТИМИЗАЦИЯ: Проверяем кэш позиций
+        cache_key = (name, symbol)
+        cached = self._position_cache.get(cache_key)
+
+        if cached is not None:
+            position, timestamp = cached
+            age = time.time() - timestamp
+            if age < POSITION_CACHE_TTL:
+                # Кэш свежий - возвращаем без запроса на биржу
+                return position
+
+        # Кэш устарел или отсутствует - запрашиваем с биржи
         exchange = await self.load_exchange(exchange_name)
         if not exchange:
             return None
 
-        name = self._normalize_name(exchange_name)
         health = self._get_health(name)
         ccxt_symbol = to_ccxt_symbol(exchange_name, symbol)
 
@@ -732,16 +775,20 @@ class ExchangeManager:
             positions = await exchange.fetch_positions([ccxt_symbol])
             health.record_request(True)
 
-            if not positions:
-                return None
+            result_position = None
+            if positions:
+                for pos in positions:
+                    if pos.get("symbol") == ccxt_symbol:
+                        contracts = pos.get("contracts") or pos.get("contractSize") or 0
+                        if contracts and float(contracts) != 0:
+                            result_position = pos
+                            break
 
-            for pos in positions:
-                if pos.get("symbol") == ccxt_symbol:
-                    contracts = pos.get("contracts") or pos.get("contractSize") or 0
-                    if contracts and float(contracts) != 0:
-                        return pos
+            # ОПТИМИЗАЦИЯ: Сохраняем в кэш (даже если None - избегаем повторных запросов)
+            self._position_cache[cache_key] = (result_position, time.time())
 
-            return None
+            return result_position
+
         except Exception as e:
             code = self._classify_exception(e)
             health.record_request(False, code)
@@ -866,6 +913,15 @@ class ExchangeManager:
         keys_to_remove = [k for k in self._market_info_cache if k.startswith(f"{name}:")]
         for key in keys_to_remove:
             del self._market_info_cache[key]
+
+        # ОПТИМИЗАЦИЯ: Очищаем кэши позиций и балансов для этой биржи
+        position_keys_to_remove = [k for k in self._position_cache if k[0] == name]
+        for key in position_keys_to_remove:
+            del self._position_cache[key]
+
+        balance_keys_to_remove = [k for k in self._balance_cache if k[0] == name]
+        for key in balance_keys_to_remove:
+            del self._balance_cache[key]
 
         # Пробуем подключиться заново
         inst = await self.load_exchange(name)

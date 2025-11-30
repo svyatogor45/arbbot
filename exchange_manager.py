@@ -351,6 +351,114 @@ class ExchangeManager:
         inst = await self.load_exchange(exchange_name)
         return inst is not None
 
+    async def add_exchange(
+        self,
+        exchange_name: str,
+        api_key: str,
+        secret_key: str,
+        passphrase: Optional[str] = None
+    ) -> bool:
+        """
+        Добавить биржу с API credentials.
+        Создаёт инстанс биржи и проверяет подключение.
+        """
+        name = self._normalize_name(exchange_name)
+
+        if name not in EXCHANGES:
+            logger.error(f"❌ Unknown exchange: {name}")
+            return False
+
+        # Сохраняем credentials во внутренний словарь для использования в _build_exchange_config
+        if not hasattr(self, '_credentials'):
+            self._credentials = {}
+
+        creds = {
+            "apiKey": api_key,
+            "secret": secret_key,
+        }
+        if passphrase:
+            creds["password"] = passphrase
+
+        self._credentials[name] = creds
+
+        # Обновляем credentials_provider для использования внутренних credentials
+        original_provider = self.credentials_provider
+        def combined_provider(ex_name: str) -> Dict[str, Any]:
+            ex = self._normalize_name(ex_name)
+            # Сначала проверяем внутренний словарь
+            if hasattr(self, '_credentials') and ex in self._credentials:
+                return self._credentials[ex]
+            # Затем используем оригинальный провайдер
+            if original_provider:
+                return original_provider(ex_name)
+            return {}
+
+        self.credentials_provider = combined_provider
+
+        # Закрываем существующее соединение, если есть
+        existing = self.active_exchanges.pop(name, None)
+        if existing:
+            try:
+                await existing.close()
+            except Exception:
+                pass
+
+        # Создаём новый инстанс с новыми credentials
+        try:
+            inst = await self._create_exchange_instance(name)
+            if inst:
+                self.active_exchanges[name] = inst
+                return True
+            return False
+        except Exception as e:
+            logger.error(f"❌ Failed to add exchange {name}: {e}")
+            return False
+
+    async def remove_exchange(self, exchange_name: str) -> bool:
+        """
+        Удалить биржу и закрыть соединение.
+        """
+        name = self._normalize_name(exchange_name)
+
+        # Закрываем соединение
+        existing = self.active_exchanges.pop(name, None)
+        if existing:
+            try:
+                await existing.close()
+                logger.info(f"🛑 Exchange {name} disconnected")
+            except Exception as e:
+                logger.warning(f"⚠️ Error closing {name}: {e}")
+
+        # Удаляем credentials
+        if hasattr(self, '_credentials') and name in self._credentials:
+            del self._credentials[name]
+
+        # Очищаем кэши
+        keys_to_remove = [k for k in self._market_info_cache if k.startswith(f"{name}:")]
+        for key in keys_to_remove:
+            del self._market_info_cache[key]
+
+        position_keys_to_remove = [k for k in self._position_cache if k.startswith(f"{name}:")]
+        for key in position_keys_to_remove:
+            del self._position_cache[key]
+
+        balance_keys_to_remove = [k for k in self._balance_cache if k.startswith(f"{name}:")]
+        for key in balance_keys_to_remove:
+            del self._balance_cache[key]
+
+        # Обновляем health
+        health = self._health.get(name)
+        if health:
+            health.connected = False
+
+        return True
+
+    async def get_balance(self, exchange_name: str, currency: str) -> Optional[float]:
+        """
+        Алиас для get_free_balance для совместимости с API.
+        """
+        return await self.get_free_balance(exchange_name, currency)
+
     # ============================================================
     # MARKET INFO И MIN ORDER SIZE
     # ============================================================

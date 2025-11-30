@@ -250,8 +250,14 @@ class TradeEngine:
                 params["direction"] = ps_lower  # long/short
             elif ex == "gate":
                 # Gate uses auto_size for closing in hedge mode
+                # Format: "close_long" or "close_short" (not just "long"/"short")
                 if is_close:
-                    params["auto_size"] = ps_lower  # close_long/close_short
+                    params["auto_size"] = f"close_{ps_lower}"  # close_long/close_short
+
+        # OKX: tdMode is required for all orders (derivatives)
+        # Must be added regardless of hedge/one-way mode
+        if ex == "okx":
+            params["tdMode"] = "cross"  # cross margin mode
 
         # reduceOnly для закрытия позиций
         if is_close:
@@ -265,7 +271,10 @@ class TradeEngine:
                 if not is_hedge_mode:
                     params["reduceOnly"] = True
             elif ex == "okx":
-                params["reduceOnly"] = True
+                # OKX: In Hedge mode, posSide is sufficient for closing (reduceOnly conflicts)
+                # In One-way mode, reduceOnly is required
+                if not is_hedge_mode:
+                    params["reduceOnly"] = True
             elif ex == "bitget":
                 # Bitget: в One-way mode нужен reduceOnly
                 if not is_hedge_mode:

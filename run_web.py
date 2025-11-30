@@ -379,6 +379,9 @@ async def lifespan(app):
     # Initialize exchange manager (lazy - connects on first use)
     ex_manager = ExchangeManager()
 
+    # Load credentials from database
+    await ex_manager.load_credentials_from_db(db)
+
     # Link to api_server globals (fix for API endpoints)
     api_server.db = db
     api_server.ex_manager = ex_manager

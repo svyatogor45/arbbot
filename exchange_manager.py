@@ -153,6 +153,41 @@ class ExchangeManager:
         # Lock для thread-safe создания инстансов
         self._create_lock = asyncio.Lock()
 
+        # Внутренний словарь credentials (заполняется из БД или add_exchange)
+        self._credentials: Dict[str, Dict[str, Any]] = {}
+
+    async def load_credentials_from_db(self, db) -> int:
+        """
+        Загрузить credentials из базы данных.
+        Возвращает количество загруженных бирж.
+        """
+        try:
+            # Получаем список подключённых бирж
+            connected = await db.get_connected_exchanges()
+            loaded = 0
+
+            for ex_name in connected:
+                name = self._normalize_name(ex_name)
+                creds_row = await db.get_api_credentials(name)
+
+                if creds_row:
+                    creds = {
+                        "apiKey": creds_row.get("api_key"),
+                        "secret": creds_row.get("secret_key"),
+                    }
+                    if creds_row.get("passphrase"):
+                        creds["password"] = creds_row.get("passphrase")
+
+                    self._credentials[name] = creds
+                    loaded += 1
+                    logger.debug(f"✅ Loaded credentials for {name}")
+
+            logger.info(f"✅ Loaded credentials for {loaded} exchanges from DB")
+            return loaded
+        except Exception as e:
+            logger.error(f"❌ Failed to load credentials from DB: {e}")
+            return 0
+
     # ============================================================
     # ВНУТРЕННИЕ ХЕЛПЕРЫ
     # ============================================================
@@ -265,7 +300,12 @@ class ExchangeManager:
             },
         }
 
-        # Подмешиваем креды
+        # Сначала проверяем внутренний словарь credentials
+        if name in self._credentials:
+            config.update(self._credentials[name])
+            return config
+
+        # Затем используем credentials_provider (если есть)
         if self.credentials_provider:
             try:
                 creds = self.credentials_provider(name) or {}

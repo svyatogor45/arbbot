@@ -262,6 +262,7 @@ async def serve_index():
 @app.get("/api/exchanges")
 async def get_exchanges():
     """Get list of all supported exchanges with connection status."""
+    logger.info(f"[DEBUG] get_exchanges called, EXCHANGES={EXCHANGES}, db={db}")
     connected = set(await db.get_connected_exchanges())
     result = []
 
